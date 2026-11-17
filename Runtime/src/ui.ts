@@ -11,6 +11,8 @@ import {isDragPacket} from './dragDrop';
 import {beforePublish, commandMarkup, commandsUrgent, overlayEdit, regionStart} from './overlayEdits';
 import {routeDrag} from './pageDrag';
 import {clipboardShortcut} from './clipboardCommands';
+// Publishing waits for a mutation, so inline style writes have to be mutations too (styleWrites.ts).
+import './styleWrites';
 
 /** Mirrors the game's DOM into the host's CEF overlay. Every element gets a stable data-jsgb id;
  *  the overlay sends back each element's laid-out box and the DOM events the player causes, which

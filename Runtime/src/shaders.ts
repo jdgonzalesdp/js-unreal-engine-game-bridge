@@ -3,6 +3,7 @@ import * as THREE from 'three-real';
 import createCrossShader from '../vendor/cross-shader/CrossShader.cjs';
 import {host, type BackgroundWorker} from './host';
 import {channelFor, isExtraAttribute} from './attributes';
+import {escapeHlslNames} from './hlslNames';
 
 /** Custom ShaderMaterials become generated Unreal materials. Both GLSL stages are rewritten as
  *  GLSL 4.50, compiled to HLSL with glslang and SPIRV-Cross (cross-shader, WebAssembly), and
@@ -137,6 +138,7 @@ function prepare(material: THREE.ShaderMaterial, stage: 'vertex' | 'fragment', i
   const raw = !!material.isRawShaderMaterial;
   const stageDefines = {...(material.defines ?? {}), [stage === 'vertex' ? 'JSGB_VERTEX' : 'JSGB_FRAGMENT']: 1};
   let src = preprocess(stripComments(expandIncludes(stage === 'vertex' ? material.vertexShader : material.fragmentShader)), stageDefines);
+  src = escapeHlslNames(src); // hlslNames.ts: a function named `line` stops Unreal's compiler
   src = src.replace(/^[ \t]*#version[^\n]*$/gm, '').replace(/^[ \t]*#extension[^\n]*$/gm, '').replace(/^[ \t]*precision\s+\w+\s+\w+\s*;/gm, '');
   const glsl3 = material.glslVersion === THREE.GLSL3;
   const u = takeDeclarations(src, ['uniform']); src = u.src;

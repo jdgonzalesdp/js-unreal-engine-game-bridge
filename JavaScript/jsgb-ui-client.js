@@ -31,6 +31,18 @@
     while (current.childNodes.length > position) current.lastChild.remove();
   }
 
+  // offsetLeft and its kin, which the page reads in layout space: from the offset parent and before any transform. The
+  // box is from the viewport and after transforms, so it can't stand in for them on anything a transform slides
+  // (Runtime/src/layoutOffsets.ts). The sizes go only where a transform makes them differ from the box.
+  function offsets(node, r, rect) {
+    if (!('offsetLeft' in node)) return;
+    rect.ol = node.offsetLeft; rect.ot = node.offsetTop;
+    if (node.offsetWidth !== Math.round(r.width)) rect.ow = node.offsetWidth;
+    if (node.offsetHeight !== Math.round(r.height)) rect.oh = node.offsetHeight;
+    const parent = id(node.offsetParent);
+    if (parent) rect.op = parent;
+  }
+
   let appliedVersion = -1;
   function layout() {
     layoutPending = false;
@@ -41,6 +53,7 @@
       const cw = node.clientWidth ? node.clientWidth - parseFloat(c.paddingLeft) - parseFloat(c.paddingRight) : r.width;
       const ch = node.clientHeight ? node.clientHeight - parseFloat(c.paddingTop) - parseFloat(c.paddingBottom) : r.height;
       rects[id(node)] = {x: r.x, y: r.y, width: r.width, height: r.height, cw, ch, display: c.display, visibility: c.visibility, opacity: c.opacity, pointerEvents: c.pointerEvents, fontSize: c.fontSize, color: c.color};
+      offsets(node, r, rects[id(node)]);
       if (window.JsgbEdit) window.JsgbEdit.measure(node, rects[id(node)]);
     }
     send({type: 'host-layout', version: appliedVersion, width: innerWidth, height: innerHeight, pixelRatio: devicePixelRatio, rects});
@@ -85,8 +98,12 @@
   // Unreal's cursor follows the page's, as a browser shows it (the host maps the CSS name to its own cursors).
   function followCursor(el) {
     if (!el || el.nodeType !== 1) return;
-    let c = String(getComputedStyle(el).cursor || 'auto').split(',').pop().trim();
+    const full = String(getComputedStyle(el).cursor || 'auto');
+    let c = full.split(',').pop().trim();
     if (c === 'auto') c = el.isContentEditable || (el.matches && el.matches('textarea,input:not([type=button],[type=submit],[type=reset],[type=checkbox],[type=radio],[type=range],[type=color],[type=file],[type=image])')) ? 'text' : 'default';
+    // An image cursor reports whole: the host maps it to Custom on a Mac and holds its own copy of the
+    // image, where the keyword fallback ("default") read as the plain arrow and fought the image.
+    else if (full.includes('url(') || full.includes('image-set(')) c = full;
     if (c !== cursor) { cursor = c; send({type: 'host-cursor', cursor: c}); }
   }
   window.JsGameUI = {

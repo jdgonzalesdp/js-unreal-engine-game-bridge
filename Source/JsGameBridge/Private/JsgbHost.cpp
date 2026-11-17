@@ -9,7 +9,9 @@
 #include "JsgbMacOverlay.h"
 #include "JsgbFiles.h"
 #include "JsgbCursor.h"
+#include "JsgbCameraComponent.h"
 #include "JsgbFrameCap.h"
+#include "JsgbLoadingScreen.h"
 #include "JsEnv.h"
 #include "JSLogger.h"
 #include "JSModuleLoader.h"
@@ -36,6 +38,7 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/SOverlay.h"
 #include "WebBrowserModule.h"
 #include "IWebBrowserSingleton.h"
 #include "IWebBrowserWindow.h"
@@ -354,7 +357,7 @@ AJsgbHost::AJsgbHost()
 	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	Mirror = CreateDefaultSubobject<UJsgbSceneMirror>(TEXT("Mirror"));
 	Audio = CreateDefaultSubobject<UJsgbAudio>(TEXT("Audio"));
-	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
+	Camera = CreateDefaultSubobject<UJsgbCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(RootComponent);
 	Camera->bConstrainAspectRatio = false;
 }
@@ -467,6 +470,7 @@ void AJsgbHost::BeginPlay()
 	ConfigurePost(Camera->PostProcessSettings);
 	Camera->PostProcessBlendWeight = 1.f;
 	SetupLumen();
+	SetupNativeSky();
 	ApplyHandheld();
 	// Engine warnings printed over the game view are not part of the game.
 	if (GEngine && !FParse::Param(FCommandLine::Get(), TEXT("JsgbScreenMessages"))) { GEngine->bEnableOnScreenDebugMessages = false; GEngine->Exec(World, TEXT("DisableAllScreenMessages")); }
@@ -727,6 +731,9 @@ void AJsgbHost::CreatePageView()
 		})
 		.OnBeforePopup_Lambda([](FString, FString) { return true; });
 	Browser->BindUObject(TEXT("jsgbpage"), PagePort, true);
+#if PLATFORM_MAC
+	JsgbWatchMacNativeLayers();
+#endif
 	GEngine->GameViewport->AddViewportWidgetContent(Browser.ToSharedRef(), 100);
 	FSlateApplication::Get().SetAllUserFocus(Browser.ToSharedRef(), EFocusCause::SetDirectly);
 	if (APlayerController* Pc = UGameplayStatics::GetPlayerController(GetWorld(), 0))
@@ -913,6 +920,8 @@ void AJsgbHost::CreateOverlay()
 #if PLATFORM_MAC
 	// The Mac browser widget leaves the cursor to the game view behind it, which showed the arrow over WebKit's cursor.
 	JsgbShowPageCursor(*Browser, UIPort);
+	// Its web view and the Metal view above it are fixed as the engine adds them, before they draw (JsgbMacOverlay.mm).
+	JsgbWatchMacNativeLayers();
 #endif
 	GEngine->GameViewport->AddViewportWidgetContent(Browser.ToSharedRef(), 100);
 	const FString Origin = FString::Printf(TEXT("http://127.0.0.1:%d/"), Port);
@@ -932,74 +941,42 @@ void AJsgbHost::CreateOverlay()
 	}
 }
 
-// A loading screen over the whole window while the game's JavaScript and files load: its name, a bar that moves,
-// and how many files it has read. It goes once the game shows something itself: its own HTML in the overlay (often
-// its own loading screen), a drawn scene, or for a page game the loaded page.
+// A loading screen while the game's JavaScript and files load: its name, a bar that moves, and how many files it has
+// read (JsgbLoadingScreen.h, in the game's look from JsgbLoadingLook.h). It goes once the game shows something itself:
+// its own HTML in the overlay (often its own loading screen), a drawn scene, or for a page game the loaded page.
 void AJsgbHost::ShowLoading()
 {
 	if (Loading.IsValid() || !GEngine || !GEngine->GameViewport || FParse::Param(FCommandLine::Get(), TEXT("JsgbNoLoadingScreen"))) { return; }
-	LoadingStart = FPlatformTime::Seconds();
 	// The package's recorded pipeline states (a bundled pipeline cache) compile on this PC's GPU driver while the
 	// loading screen is up, as fast as they can, so no draw stops to compile one later.
 	FShaderPipelineCache::SetBatchMode(FShaderPipelineCache::BatchMode::Fast);
 	FShaderPipelineCache::ResumeBatching();
-	const FString Name = Title.IsEmpty() ? FString(TEXT("Loading")) : Title;
-	auto Phase = [this]() { return static_cast<float>(FMath::Fmod((FPlatformTime::Seconds() - LoadingStart) * 0.6, 1.0)); };
-	Loading = SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush")).BorderBackgroundColor(FLinearColor(0.02f, 0.025f, 0.035f, 1.f))
-		.HAlign(HAlign_Center).VAlign(VAlign_Center).Visibility(EVisibility::HitTestInvisible)
-		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0, 0, 0, 18)
-			[
-				SNew(STextBlock).Text(FText::FromString(Name)).Font(FCoreStyle::GetDefaultFontStyle("Bold", 34)).ColorAndOpacity(FLinearColor(0.92f, 0.94f, 0.97f))
-			]
-			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
-			[
-				SNew(SBox).WidthOverride(420.f).HeightOverride(6.f)
-				[
-					SNew(SOverlay)
-					+ SOverlay::Slot()[SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush")).BorderBackgroundColor(FLinearColor(1.f, 1.f, 1.f, 0.12f))]
-					+ SOverlay::Slot().HAlign(HAlign_Left)
-					.Padding(TAttribute<FMargin>::CreateLambda([Phase]() { return FMargin(FMath::Max(0.f, Phase() * 520.f - 120.f), 0, 0, 0); }))
-					[
-						SNew(SBox).WidthOverride(TAttribute<FOptionalSize>::CreateLambda([Phase]() { const float X = Phase() * 520.f - 120.f; return FOptionalSize(FMath::Clamp(FMath::Min(120.f, 120.f + X), 0.f, FMath::Max(0.f, 420.f - X))); }))
-						[
-							SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush")).BorderBackgroundColor(FLinearColor(0.49f, 0.78f, 1.f))
-						]
-					]
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0, 14, 0, 0)
-			[
-				SNew(STextBlock).Font(FCoreStyle::GetDefaultFontStyle("Regular", 14)).ColorAndOpacity(FLinearColor(0.6f, 0.65f, 0.72f))
-				.Text(TAttribute<FText>::CreateLambda([this]()
-				{
-					const int32 Files = Bridge ? Bridge->FilesRead.load() : 0;
-					if (FShaderPipelineCache::IsPrecompiling())
-					{
-						return FText::FromString(FString::Printf(TEXT("Preparing shaders for this PC, %u left"), FShaderPipelineCache::NumPrecompilesRemaining()));
-					}
-					return FText::FromString(Files > 0 ? FString::Printf(TEXT("Loading, %d files read"), Files) : FString(TEXT("Starting")));
-				}))
-			]
-		];
-	// Above the game view and the overlay browser, below the frame rate readout.
-	GEngine->GameViewport->AddViewportWidgetContent(Loading.ToSharedRef(), 250);
+	Loading = FJsgbLoadingScreen::Show(GameDir, Title, [this]()
+	{
+		const int32 Files = Bridge ? Bridge->FilesRead.load() : 0;
+		if (FShaderPipelineCache::IsPrecompiling())
+		{
+			return FText::FromString(FString::Printf(TEXT("Preparing shaders for this PC, %u left"), FShaderPipelineCache::NumPrecompilesRemaining()));
+		}
+		return FText::FromString(Files > 0 ? FString::Printf(TEXT("Loading, %d files read"), Files) : FString(TEXT("Starting")));
+	});
 }
 
 void AJsgbHost::UpdateLoading()
 {
 	if (!Loading.IsValid()) { return; }
-	const bool bPage = !PageIndex.IsEmpty();
-	const bool bShown = bPage ? bDocumentReady
-		: (UIPort && UIPort->AppliedUIVersion > 0) || (Mirror && Mirror->DrawnEntities > 0) || (Bridge && Bridge->bReady && ReadyFrame >= 0);
-	// It stays until the pipeline cache is compiled too; two minutes at most, so a game that never reports anything
-	// isn't hidden behind it.
-	if ((!bShown || FShaderPipelineCache::IsPrecompiling()) && FPlatformTime::Seconds() - LoadingStart < 120.0) { return; }
+	FJsgbLoadingProgress Progress;
+	Progress.bPage = !PageIndex.IsEmpty();
+	Progress.bPageLoaded = bDocumentReady;
+	Progress.bOverlay = Browser.IsValid();
+	Progress.bUiShown = UIPort && UIPort->AppliedUIVersion > 0;
+	Progress.bSceneDrawn = Mirror && Mirror->DrawnEntities > 0;
+	Progress.bReady = Bridge && Bridge->bReady && ReadyFrame >= 0;
+	Progress.bShadersPending = FShaderPipelineCache::IsPrecompiling();
+	if (!Loading->Update(Progress)) { return; }
 	FShaderPipelineCache::SetBatchMode(FShaderPipelineCache::BatchMode::Background);
-	if (GEngine && GEngine->GameViewport) { GEngine->GameViewport->RemoveViewportWidgetContent(Loading.ToSharedRef()); }
+	UE_LOG(LogJsgbHost, Display, TEXT("Loading screen shown for %.1f s"), Loading->ShownSeconds());
 	Loading.Reset();
-	UE_LOG(LogJsgbHost, Display, TEXT("Loading screen shown for %.1f s"), FPlatformTime::Seconds() - LoadingStart);
 }
 
 void AJsgbHost::ShowReloadBanner(const FString& Text)
@@ -1130,6 +1107,17 @@ void AJsgbHost::StartServer()
 			O->SetNumberField(TEXT("lastCssMs"), H->CssStart >= 0 ? -1 : H->LastCssMs);
 			O->SetNumberField(TEXT("recordedFrames"), H->RecordIndex);
 			O->SetStringField(TEXT("upscaler"), H->Upscaler);
+			if (H->Bridge)
+			{
+				const FString SceneQualityJson = H->Bridge->GetSceneQuality();
+				TSharedPtr<FJsonObject> SceneQuality;
+				if (!SceneQualityJson.IsEmpty() && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(SceneQualityJson), SceneQuality) && SceneQuality)
+				{
+					O->SetObjectField(TEXT("sceneQuality"), SceneQuality);
+				}
+			}
+			O->SetStringField(TEXT("lightingTier"), H->LightingTierNow);
+			O->SetStringField(TEXT("lightingTierChosen"), H->LightingTier);
 			O->SetNumberField(TEXT("fps"), H->HudFps);
 			O->SetNumberField(TEXT("presentedFps"), H->HudPresentedFps);
 			O->SetNumberField(TEXT("gpuMs"), FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles()));
@@ -1287,11 +1275,14 @@ void AJsgbHost::StartServer()
 			Json(O);
 			return true;
 		}
-		if ((Route == TEXT("/bridge/eval") || Route == TEXT("/bridge/input") || Route == TEXT("/bridge/capture") || Route == TEXT("/bridge/close")) && bPost)
+		if ((Route == TEXT("/bridge/eval") || Route == TEXT("/bridge/input") || Route == TEXT("/bridge/capture") || Route == TEXT("/bridge/console") || Route == TEXT("/bridge/close")) && bPost)
 		{
 			if (!bRemote) { Done(FHttpServerResponse::Error(EHttpServerResponseCodes::Forbidden, TEXT("start Unreal with -JsgbAllowRemote"))); return true; }
 			auto O = MakeShared<FJsonObject>();
 			if (Route == TEXT("/bridge/eval")) { O->SetStringField(TEXT("result"), H->Eval(Body(R))); }
+			// A live Unreal console for development (cvars, scalability), at the eval route's trust level: tuning
+			// shadow settings against a running scene otherwise costs a relaunch per guess.
+			else if (Route == TEXT("/bridge/console")) { if (GEngine) { GEngine->Exec(H->GetWorld(), *Body(R).TrimStartAndEnd()); } O->SetBoolField(TEXT("accepted"), GEngine != nullptr); }
 			else if (Route == TEXT("/bridge/input")) { if (Body(R).Contains(TEXT("\"keydown\"")) && H->Camera) { H->KeyProbeAt = FPlatformTime::Seconds(); H->KeyProbeFrom = H->Camera->GetComponentTransform(); } if (H->UIPort) { H->UIPort->SendInput(Body(R)); } else if (UJsgbBridge* B = H->Bridge) { const FString In = Body(R); B->RunOnJs([B, In] { if (B->OnUIInput.IsBound()) { B->OnUIInput.Execute(In); } }); } O->SetBoolField(TEXT("accepted"), true); }
 			else if (Route == TEXT("/bridge/capture")) { const FString Path = Body(R).TrimStartAndEnd(); H->Capture(Path); O->SetStringField(TEXT("path"), Path); }
 			else { O->SetBoolField(TEXT("closing"), true); FPlatformMisc::RequestExit(false); }
@@ -1475,8 +1466,20 @@ void AJsgbHost::ApplyHandheld()
 {
 	const TCHAR* Cmd = FCommandLine::Get();
 	const bool bNvidia = GRHIVendorId == 0x10DE;
-	bHandheld = FParse::Param(Cmd, TEXT("JsgbHandheld")) || (!bNvidia && !FParse::Param(Cmd, TEXT("JsgbNoHandheld")));
-	if (!bHandheld) { return; }
+	// -JsgbDesktop: a desktop-class GPU that is not NVIDIA (an Apple Silicon Mac) takes the full
+	// lighting path (Lumen tiers, native sun/sky) instead of the handheld preset.
+	const bool bDesktop = FParse::Param(Cmd, TEXT("JsgbDesktop"));
+	bHandheld = !bDesktop && (FParse::Param(Cmd, TEXT("JsgbHandheld")) || (!bNvidia && !FParse::Param(Cmd, TEXT("JsgbNoHandheld"))));
+	if (!bHandheld)
+	{
+		if (bDesktop)
+		{
+			// The page still presents at 60: an uncapped desktop runs its JS tick at display rate.
+			if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS"))) { V->Set(TEXT("60"), ECVF_SetByCode); }
+			UE_LOG(LogJsgbHost, Display, TEXT("Desktop tier on (GPU %s, vendor 0x%04x): full lighting path, Lumen available"), *GRHIAdapterName, GRHIVendorId);
+		}
+		return;
+	}
 	auto Set = [](const TCHAR* Name, const TCHAR* Value) { if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(Name)) { V->Set(Value, ECVF_SetByCode); } };
 	// No Lumen, DLSS or frame generation.
 	if (bLumenOn) { SetLumen(false); }
@@ -1648,6 +1651,35 @@ TSharedRef<SWidget> AJsgbHost::MakeJitterGraph()
 		[
 			Bars
 		];
+}
+
+void AJsgbHost::UpdateViewBars()
+{
+	if (!Mirror || !GEngine || !GEngine->GameViewport) { return; }
+	if (!ViewBars.IsValid())
+	{
+		auto Bar = []() { return SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush")).BorderBackgroundColor(FLinearColor(0.f, 0.f, 0.f, 1.f)); };
+		auto Size = [this](int32 Edge) {
+			return TAttribute<FOptionalSize>::CreateLambda([this, Edge]() {
+				const float V = Edge == 0 ? BarRect.Min.X : Edge == 1 ? BarWindow.X - BarRect.Max.X : Edge == 2 ? BarRect.Min.Y : BarWindow.Y - BarRect.Max.Y;
+				return FOptionalSize(FMath::Max(0.f, V));
+			});
+		};
+		// Below the browser overlay (100), above the game view: UI panels paint over the bars, the scene does not.
+		ViewBars = SNew(SOverlay).Visibility(EVisibility::HitTestInvisible)
+			+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Fill) [ SNew(SBox).WidthOverride(Size(0)) [ Bar() ] ]
+			+ SOverlay::Slot().HAlign(HAlign_Right).VAlign(VAlign_Fill) [ SNew(SBox).WidthOverride(Size(1)) [ Bar() ] ]
+			+ SOverlay::Slot().HAlign(HAlign_Fill).VAlign(VAlign_Top) [ SNew(SBox).HeightOverride(Size(2)) [ Bar() ] ]
+			+ SOverlay::Slot().HAlign(HAlign_Fill).VAlign(VAlign_Bottom) [ SNew(SBox).HeightOverride(Size(3)) [ Bar() ] ];
+		GEngine->GameViewport->AddViewportWidgetContent(ViewBars.ToSharedRef(), 90);
+	}
+	if (Mirror->bViewRectCss)
+	{
+		const FVector4& R = Mirror->ViewRectCss;
+		BarRect = FIntRect(FMath::RoundToInt(R.X), FMath::RoundToInt(R.Y), FMath::RoundToInt(R.X + R.Z), FMath::RoundToInt(R.Y + R.W));
+		BarWindow = FIntPoint(FMath::RoundToInt(Mirror->WindowCss.X), FMath::RoundToInt(Mirror->WindowCss.Y));
+	}
+	else { BarRect = FIntRect(0, 0, BarWindow.X, BarWindow.Y); }
 }
 
 void AJsgbHost::UpdateHud(float DeltaSeconds)
@@ -2039,6 +2071,9 @@ void AJsgbHost::Tick(float DeltaSeconds)
 		Mirror->PixelScale = Dpi;
 		UJsgbBridge* B = Bridge; B->RunOnJs([B, Css] { if (B->OnViewport.IsBound()) { B->OnViewport.Execute(Css.X, Css.Y); } });
 	}
+	UpdateViewBars();
+	UpdateNativeSky();
+	UpdateLightingTier(DeltaSeconds);
 
 	if (ReadyFrame < 0 && Bridge->bReady) { ReadyFrame = Frame; ReadySeconds = GameSeconds(); CaptureStart = ReadySeconds; Bridge->Log(TEXT("log"), FString::Printf(TEXT("game ready at host frame %lld"), Frame)); }
 	RunScript();

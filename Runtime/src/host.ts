@@ -75,6 +75,8 @@ export interface JsgbHost {
   graphics?: {get(): string; set(json: string): void};
   /** The most frames a second the game asks Unreal to present, 0 for no request (see frameRate.ts). */
   frameRate?(fps: number): void;
+  /** The scene's quality tier and resolved sun/sky as normalized JSON; empty drops it (see sceneQuality.ts). */
+  sceneQuality?(json: string): void;
   /** Persistent key/value store for localStorage, sessionStorage and IndexedDB. remove deletes an entry's file (a host
    *  without it gets an empty entry saved instead). */
   storage?: {load(key: string): string | null; save(key: string, data: string): void | boolean; remove?(key: string): void};

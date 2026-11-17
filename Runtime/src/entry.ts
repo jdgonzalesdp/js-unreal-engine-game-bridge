@@ -21,6 +21,7 @@ import {flushAudio, audioTime} from './audio';
 import './worker';
 import './display';
 import './frameRate';
+import './sceneQuality';
 import {refreshGraphics} from './graphics';
 import './text';
 // Exports: pictures of the scene, image files, video encoding and saved files.
@@ -74,7 +75,7 @@ g.__jsgb = {
     // A JavaScript frame much longer than 60 FPS allows gets a breakdown in the log.
     if (booted && t4 - t0 > 30) {
       const p = pumpTiming;
-      host.log('log', `slow js frame ${frames}: ${t4 - t0} ms = worker replies ${p.workersMs} (${p.workerReplies}) + timers ${p.timersMs} (${p.timerCalls} calls, slowest ${p.slowestMs} ms in ${p.slowest}) + animation frame ${p.rafMs} (${p.rafCalls} callbacks) + scene export ${t2 - t1} + ui ${t3 - t2} + audio ${t4 - t3}`);
+      host.log('log', `slow js frame ${frames}: ${t4 - t0} ms = worker replies ${p.workersMs} (${p.workerReplies}) + timers ${p.timersMs} (${p.timerCalls} calls, slowest ${p.slowestMs} ms in ${p.slowest} scheduled at ${p.slowestWhere}) + animation frame ${p.rafMs} (${p.rafCalls} callbacks) + scene export ${t2 - t1} + ui ${t3 - t2} + audio ${t4 - t3}`);
     }
   },
   input, ui: uiInput, publish: () => publishUI(0), viewport: setViewport, emit: emitEvent, navigate: navigateTo,

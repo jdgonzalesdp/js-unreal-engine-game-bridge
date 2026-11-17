@@ -299,6 +299,13 @@ public:
 	 *  volumetric scattering; ambient and hemisphere light in the bridge's materials is scaled by LumenAmbientScale. */
 	bool bLumen = false;
 	float SunSourceAngle = 1.f;
+	/** Native sun/sky (the host's SkyAtmosphere rig, driven by the streamed scene quality): the mirrored
+	 *  main sun (the directional light travelling along NativeSunDir, three.js axes) is hidden in favour
+	 *  of the native one, and with bNativeSky the game's sky dome (draw-first surfaces) is hidden too.
+	 *  Added suns and practicals keep mirroring. Off unless the game streams scene quality. */
+	bool bNativeSun = false;
+	bool bNativeSky = false;
+	FVector NativeSunDir = FVector(0, -1, 0);
 	/** Lumen mode: extra exposure in stops, bloom and directional light multipliers on top of the game's own. */
 	float ExposureOffset = 0.f, BloomScale = 1.f, SunScale = 1.f;
 	float LumenAmbientScale = 1.f;
@@ -325,6 +332,12 @@ public:
 	FIntPoint ViewportSize = FIntPoint(1920, 1080);
 	/** Device pixels per CSS pixel (2 on a Retina Mac with high DPI on). Line widths are CSS pixels, as in the browser. */
 	float PixelScale = 1.f;
+	/** The page canvas's rectangle in CSS pixels (x, y, w, h) and the window's CSS size, derived from the
+	 *  frame's view-rect record; the host blacks out the window outside it, as the page background does in
+	 *  a browser (a POV letterbox frame must not have scene spilling past its pillar bars). */
+	FVector4 ViewRectCss = FVector4(0, 0, 0, 0);
+	FVector2D WindowCss = FVector2D::ZeroVector;
+	bool bViewRectCss = false;
 
 private:
 	UStaticMesh* BuildMesh(const FJsgbPendingGeometry& G, int32& OutSlots);

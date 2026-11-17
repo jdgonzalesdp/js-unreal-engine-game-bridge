@@ -8,6 +8,12 @@
 
 EMouseCursor::Type JsgbCursorFromCss(const FString& Css)
 {
+#if PLATFORM_MAC
+	// An image cursor (url() / image-set) is the page's own drawing; on a Mac JsgbCursorMac.mm hands Slate a held
+	// copy of it, so report Custom rather than the list's keyword fallback (usually "default", which would make
+	// Slate show the arrow and fight WebKit's image — the Direct Select flicker).
+	if (Css.Contains(TEXT("url(")) || Css.Contains(TEXT("image-set("))) { return EMouseCursor::Custom; }
+#endif
 	// A cursor list ("url(hand.png) 4 4, pointer") falls back to its last keyword, as a browser does without the image.
 	FString Name = Css;
 	int32 Comma = INDEX_NONE;
@@ -52,11 +58,18 @@ void JsgbShowPageCursor(SWidget& Overlay, UJsgbUIPort* Port)
 #if PLATFORM_MAC
 		// One writer: Slate gets the cursor WebKit already set, so its own set on each mouse move changes nothing.
 		// Answering with the reported keyword fought WebKit whenever the two differed (JsgbCursorMac.mm).
+		// The shape is handed over only when it changes: SetTypeShape re-sets the live cursor on every call,
+		// which churned (and once crashed on) WebKit's transient image cursors at mouse-move rate.
 		if (void* Shown = JsgbMacShownCursor(P ? P->PageCursor : TOptional<EMouseCursor::Type>()))
 		{
 			if (FSlateApplication::IsInitialized())
 			{
-				if (const TSharedPtr<ICursor> Cursor = FSlateApplication::Get().GetPlatformCursor()) { Cursor->SetTypeShape(EMouseCursor::Custom, Shown); return EMouseCursor::Custom; }
+				static void* Handed = nullptr;
+				if (const TSharedPtr<ICursor> Cursor = FSlateApplication::Get().GetPlatformCursor())
+				{
+					if (Shown != Handed) { Cursor->SetTypeShape(EMouseCursor::Custom, Shown); Handed = Shown; }
+					return EMouseCursor::Custom;
+				}
 			}
 		}
 #endif

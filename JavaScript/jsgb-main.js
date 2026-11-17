@@ -73,6 +73,8 @@ globalThis.__jsgbHost = {
   graphics: {get: () => bridge.GraphicsGet(), set: json => bridge.GraphicsSet(json)},
   // window.jsgb.setFrameRate (Runtime/src/frameRate.ts): the most frames a second Unreal presents, 0 for no request.
   frameRate: bridge.SetFrameRate ? fps => bridge.SetFrameRate(+fps || 0) : undefined,
+  // window.jsgb.setSceneQuality (Runtime/src/sceneQuality.ts): normalized tier and resolved sun/sky JSON.
+  sceneQuality: bridge.SetSceneQuality ? json => bridge.SetSceneQuality(String(json ?? '')) : undefined,
   camera: bridge.CameraTake ? {take: () => bridge.CameraTake(), give: (v, json) => bridge.CameraGive(v, json), config: json => bridge.CameraConfig(json), off: () => bridge.CameraOff()} : undefined,
   sink: {
     geometry: (id, pos, nrm, uv, col, colorSize, idx, groups) => bridge.Geometry(id, buf(pos), buf(nrm), buf(uv), buf(col), colorSize, buf(idx), groups),

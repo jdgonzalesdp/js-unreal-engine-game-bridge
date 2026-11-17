@@ -15,6 +15,7 @@ import {Context2D, Path2DImpl, setImageReader, OffscreenCanvasImpl, ImageDataImp
 import {installFilePicker} from './filePicker';
 import {installDialogs} from './dialogs';
 import {installPageApis} from './pageApis';
+import {installLayoutOffsets} from './layoutOffsets';
 
 /** The page the web build boots in, as a linkedom document. The game's UI code builds its DOM
  *  here exactly as it does in a browser; the Unreal host mirrors it into the CEF overlay. */
@@ -127,7 +128,7 @@ export const pointerLocked = () => pointerLockElement !== null;
 // everything else a zero box.
 const EP = page.HTMLElement.prototype as Record<string, any>;
 const ElP = page.Element.prototype as Record<string, any>;
-export const layoutBoxes = new Map<string, {x: number; y: number; width: number; height: number; cw?: number; ch?: number; display?: string; visibility?: string; opacity?: string}>();
+export const layoutBoxes = new Map<string, {x: number; y: number; width: number; height: number; cw?: number; ch?: number; ol?: number; ot?: number; ow?: number; oh?: number; op?: string; display?: string; visibility?: string; opacity?: string}>();
 const fullScreen = (el: Record<string, any>) => el.tagName === 'CANVAS' || el.parentNode === doc.body || el === doc.body || el === doc.documentElement;
 function box(el: Record<string, any>) { const id = el.getAttribute?.('data-jsgb'); return id ? layoutBoxes.get(id) : undefined; }
 /** Inline `width`/`height` in px, or 100% of a parent that has a size. Measured containers (react-three-fiber's
@@ -163,12 +164,11 @@ EP.blur = function () { if (activeElement === this) activeElement = null; };
 EP.click ??= function (this: Record<string, any>) { this.dispatchEvent(new g.MouseEvent('click', {bubbles: true, cancelable: true})); };
 // A focused element that left the document gives focus back to the body (focusFixup.ts).
 try { Object.defineProperty(doc, 'activeElement', {get: () => (activeElement = stillFocused(activeElement)) ?? doc.body, configurable: true}); } catch { /* ignore */ }
-for (const prop of ['offsetWidth', 'offsetHeight', 'offsetLeft', 'offsetTop', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight'] as const) {
-  if (!(prop in EP) || prop.startsWith('offset') || prop.startsWith('client')) Object.defineProperty(EP, prop, {get() {
-    const r = this.getBoundingClientRect();
-    return prop.endsWith('Width') ? r.width : prop.endsWith('Height') ? r.height : prop === 'offsetLeft' ? r.x : r.y;
-  }, configurable: true});
+for (const prop of ['clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight'] as const) {
+  if (!(prop in EP) || prop.startsWith('client')) Object.defineProperty(EP, prop, {get() { const r = this.getBoundingClientRect(); return prop.endsWith('Width') ? r.width : r.height; }, configurable: true});
 }
+// offsetLeft and its kin are from the offset parent and before transforms, which the box is not (layoutOffsets.ts).
+installLayoutOffsets(EP, box, id => doc.querySelector(`[data-jsgb="${id}"]`));
 if (!('scrollTop' in EP)) { Object.defineProperty(EP, 'scrollTop', {get() { return this.__st ?? 0; }, set(v) { this.__st = v; }, configurable: true}); }
 if (!('scrollLeft' in EP)) { Object.defineProperty(EP, 'scrollLeft', {get() { return this.__sl ?? 0; }, set(v) { this.__sl = v; }, configurable: true}); }
 if (!('inert' in EP)) Object.defineProperty(EP, 'inert', {get() { return this.hasAttribute('inert'); }, set(v) { this.toggleAttribute('inert', !!v); }, configurable: true});

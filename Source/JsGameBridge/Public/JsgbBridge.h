@@ -94,6 +94,11 @@ public:
 	 *  sets it; AJsgbHost::Tick applies it (JsgbFrameCap.h, JsgbFrameCap.cpp). */
 	UFUNCTION() void SetFrameRate(float Fps);
 	std::atomic<float> AskedFrameRate{0.f};
+	/** window.jsgb.setSceneQuality: normalized quality tier and resolved sun/sky JSON; empty drops it.
+	 *  Any thread sets it; lighting stages read it on the game thread (JsgbSceneQuality.cpp). */
+	UFUNCTION() void SetSceneQuality(const FString& Json);
+	/** The normalized scene-quality JSON in force, or empty. Any thread. */
+	FString GetSceneQuality();
 	/** Applies a display change ({width?, height?, mode?, vsync?, maxFps?}) without saving Unreal's settings. Game thread. */
 	static void ApplyDisplay(const TSharedPtr<class FJsonObject>& In);
 	/** At launch: clears any frame cap left in Unreal's shared settings, then applies this game's saved display settings. */
@@ -256,6 +261,8 @@ public:
 	FCriticalSection DisplayLock;
 	FString DisplayModesJson, DisplayJson;
 	FString GraphicsJson = TEXT("{\"lumen\":false,\"available\":false}");
+	FCriticalSection SceneQualityLock;
+	FString SceneQualityJson;
 	/** When the JavaScript thread made the newest scene frame the game thread applied (FPlatformTime seconds). */
 	double LastFrameProducedAt = 0;
 	UPROPERTY() TObjectPtr<UJsgbSceneMirror> Mirror;

@@ -61,10 +61,11 @@ const BASE: Key = [2, 0, 0];
 const compare = (a: Key, b: Key) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 
 /** An object drawn this frame, by the id its record carries. Only surfaces Unreal draws see-through take a priority:
- *  an opaque one that writes depth with normal blending stays opaque there, and sorting does not reach it. */
-export function noteDrawOrder(id: number, o: Obj) {
+ *  an opaque one that writes depth with normal blending stays opaque there, and sorting does not reach it. Lines
+ *  (every: true) all take one, since Unreal draws every line object in one list in this order. */
+export function noteDrawOrder(id: number, o: Obj, every = false) {
   const m = Array.isArray(o.material) ? o.material[0] : o.material;
-  if (!m || (!m.transparent && m.depthWrite !== false && m.blending === THREE.NormalBlending && listOf(m) === 0)) return;
+  if (!m || (!every && !m.transparent && m.depthWrite !== false && m.blending === THREE.NormalBlending && listOf(m) === 0)) return;
   frameKeys.set(id, [listOf(m), groupOrderOf(o), o.renderOrder || 0]);
 }
 

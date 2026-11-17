@@ -24,5 +24,19 @@
     "https://cdn.jsdelivr.net",
     "https://overpass-api.de",
     "https://nominatim.openstreetmap.org"
-  ]
+  ],
+  "loading": {
+    "background": "#14181a",
+    "title": "PrepViz",
+    "titleColor": "#f1f3ee",
+    "byline": "from",
+    "bylineColor": "#b2b9b4",
+    "bylineLogo": {
+      "file": "Games/brand/livalittle-wordmark-ink.png",
+      "height": 18,
+      "tint": "#f1f3eedb"
+    },
+    "accent": "#f07b2b",
+    "statusColor": "#787e7b"
+  }
 }

@@ -23,6 +23,8 @@ public class JsGameBridge : ModuleRules {
   PublicDependencyModuleNames.Add(Target.Type == TargetType.Editor || !Cef152 ? "WebBrowser" : "WebBrowserCef");
   // FSoundQualityInfo for the runtime Ogg Vorbis decoder.
   PrivateIncludePathModuleNames.Add("TargetPlatform");
+  // The loading screen is drawn by the engine's movie player while engine startup keeps the game thread busy.
+  PrivateDependencyModuleNames.Add("MoviePlayer");
   // Mac: the UI overlay is a native WKWebView (Private/JsgbMacOverlay.mm makes it transparent).
   // VideoToolbox, CoreMedia and CoreVideo: H.264 for the page's VideoEncoder (Private/JsgbVideoEncodeMac.mm).
   if(Target.Platform==UnrealTargetPlatform.Mac){PublicFrameworks.AddRange(new[]{"AppKit","WebKit","VideoToolbox","CoreMedia","CoreVideo"});}

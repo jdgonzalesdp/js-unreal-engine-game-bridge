@@ -133,6 +133,23 @@ private:
 	 *  (F9, window.jsgb.graphics); -JsgbLumen[=high|light] starts with it on (JsgbFidelity.cpp). */
 	void SetupLumen();
 	void SetLumen(bool bOn);
+	/** Native sun/sky (JsgbNativeSky.cpp): SkyAtmosphere + atmosphere sun + captured sky light, driven by
+	 *  the streamed scene quality's resolved sun. SetupNativeSky builds the (hidden) rig;
+	 *  UpdateNativeSky follows the stream each tick and hands the mirror its skip flags. */
+	void SetupNativeSky();
+	void UpdateNativeSky();
+	UPROPERTY() TObjectPtr<class UDirectionalLightComponent> NativeSun;
+	UPROPERTY() TObjectPtr<class USkyAtmosphereComponent> NativeAtmosphere;
+	UPROPERTY() TObjectPtr<class USkyLightComponent> NativeSkyLight;
+	FString NativeSkyJson;
+	bool bNativeSkyActive = false;
+	/** Lighting tiers (JsgbNativeSky.cpp): the streamed tier, the effective tier after fps demotion,
+	 *  and the governor's timers. Empty until a game streams scene quality. */
+	FString LightingTier, LightingTierNow, LightingTierJson;
+	double TierEvalSeconds = 0, TierAgeSeconds = 0;
+	int32 TierGoodWindows = 0, TierBadWindows = 0;
+	void UpdateLightingTier(float DeltaSeconds);
+	void ApplyLightingTier();
 	/** Tells the game's JavaScript whether Lumen mode is on, and takes its changes. */
 	void PublishGraphics();
 	UPROPERTY() TObjectPtr<class USkyLightComponent> LumenSky;
@@ -279,13 +296,19 @@ private:
 	/** Reads recorded frames back from the GPU a few frames later, so recording doesn't make the CPU wait for the GPU. */
 	TSharedPtr<class FFrameGrabber> Grabber;
 	TSharedPtr<class SWidget> Banner;
-	/** The loading screen: the game's name and a moving bar, from launch until the game shows something. */
-	TSharedPtr<class SWidget> Loading;
-	double LoadingStart = 0;
+	/** The loading screen (Private/JsgbLoadingScreen.h), from launch until the game shows something, in the game's
+	 *  look when its config has one. */
+	TSharedPtr<class FJsgbLoadingScreen> Loading;
 	void ShowLoading();
 	void UpdateLoading();
 	TSharedPtr<class STextBlock> BannerText;
 	double BannerUntil = 0;
+	/** Black bars outside the page canvas's rectangle (below the overlay): in a browser the page background
+	 *  shows there, where the expanded full-window frustum would spill scene past a POV letterbox frame. */
+	TSharedPtr<class SWidget> ViewBars;
+	FIntRect BarRect = FIntRect(0, 0, 0, 0);
+	FIntPoint BarWindow = FIntPoint(0, 0);
+	void UpdateViewBars();
 };
 
 UCLASS()

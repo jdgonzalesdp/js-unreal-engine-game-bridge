@@ -7,8 +7,9 @@ class SWidget;
 class UJsgbUIPort;
 
 // The overlay page's mouse cursor in Unreal. The overlay (jsgb-ui-client.js) reports the CSS cursor under the mouse each
-// time it changes, as {"type":"host-cursor","cursor":"<keyword>"}: the last keyword of the cursor list, with auto already
-// turned into text or default. The UI port keeps it (UJsgbUIPort::PageCursor) and Slate shows it over the overlay.
+// time it changes, as {"type":"host-cursor","cursor":"<cursor>"}: the last keyword of the cursor list (auto already
+// turned into text or default), or the whole list for an image cursor. The UI port keeps it (UJsgbUIPort::PageCursor)
+// and Slate shows it over the overlay.
 
 /** The Unreal cursor for a CSS cursor keyword (pointer, text, grab, ns-resize, ...); Default when none is close. */
 EMouseCursor::Type JsgbCursorFromCss(const FString& Css);

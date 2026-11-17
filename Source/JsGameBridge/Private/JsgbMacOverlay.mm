@@ -152,6 +152,58 @@ namespace
 			return Event;
 		}];
 	}
+
+	/** The engine adds the overlay's web view to the game view and, right after it, a Metal view for the Slate drawn
+	 *  above it (CreateNativeLayer), and again each time the overlay's Slate layer changes. The sweep below runs every 30
+	 *  frames, so for up to 30 frames the window showed that Metal view: a launch recording alternated every frame
+	 *  between a stale, half-size loading screen and black for half a second (3.7 s on a slower launch). Each view is now
+	 *  handled as it is added, before anything draws into it. Main thread. */
+	IMP GDidAddSubview = nullptr;
+
+	void HandleAddedView(NSView* Content, NSView* Added)
+	{
+		NSWindow* Window = Content.window;
+		if (Window == nil || Window.contentView != Content) { return; }
+		if (HoldsWebView(Added) && ClearWebViews(Added) > 0) { UE_LOG(LogJsgbMacOverlay, Display, TEXT("UI overlay: web view made transparent as it was added")); }
+		if (Added == Content || ![Added isKindOfClass:[Content class]] || Added.hidden) { return; }
+		for (NSView* Child in Content.subviews)
+		{
+			if (HoldsWebView(Child))
+			{
+				Added.hidden = YES;
+				UE_LOG(LogJsgbMacOverlay, Display, TEXT("UI overlay: Metal layer view above the web view hidden as it was added"));
+				return;
+			}
+		}
+	}
+
+	void DidAddSubview(id Self, SEL Selector, NSView* Added)
+	{
+		if (GDidAddSubview != nullptr) { ((void (*)(id, SEL, NSView*))GDidAddSubview)(Self, Selector, Added); }
+		HandleAddedView((NSView*)Self, Added);
+	}
+
+	/** Hooks didAddSubview: on the engine's game view class (FMetalView, MetalViewport.h), once. */
+	void WatchNativeLayers()
+	{
+		static bool bWatching = false;
+		Class Cls = NSClassFromString(@"FMetalView");
+		if (bWatching || Cls == nil) { return; }
+		bWatching = true;
+		const SEL Selector = @selector(didAddSubview:);
+		const Method Existing = class_getInstanceMethod(Cls, Selector);
+		if (Existing == nullptr) { return; }
+		// The class inherits NSView's method: an override is added that calls it. Had it its own, that is replaced and called.
+		const IMP Inherited = method_getImplementation(Existing);
+		if (class_addMethod(Cls, Selector, (IMP)DidAddSubview, method_getTypeEncoding(Existing))) { GDidAddSubview = Inherited; }
+		else { GDidAddSubview = method_setImplementation(Existing, (IMP)DidAddSubview); }
+		UE_LOG(LogJsgbMacOverlay, Display, TEXT("UI overlay: web views and Metal layer views are fixed as the engine adds them"));
+	}
+}
+
+void JsgbWatchMacNativeLayers()
+{
+	MainThreadCall(^{ WatchNativeLayers(); });
 }
 
 void JsgbMakeMacWebViewsTransparent()
@@ -159,6 +211,7 @@ void JsgbMakeMacWebViewsTransparent()
 	dispatch_async(dispatch_get_main_queue(), ^
 	{
 		StopKeyHandBacks();
+		WatchNativeLayers();
 		int32 Cleared = 0, Hidden = 0;
 		for (NSWindow* Window in [NSApp windows])
 		{

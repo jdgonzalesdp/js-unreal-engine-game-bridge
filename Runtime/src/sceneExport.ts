@@ -18,6 +18,7 @@ import {firstChange, materialInputs, quickExtras, rememberInputs, sameInputs} fr
 import {fatLineGeometry} from './fatLines';
 import {splatStandIns} from './splatStandIn';
 import {backdropMatrix, drawsThrough, flushDrawOrders, noteDrawOrder, setDrawEye} from './drawOrder';
+import {composeViewRect, fullWindowFrustum, type ViewRect} from './viewRect';
 
 /** Mirrors the game's Three.js scene into Unreal each frame. Geometry, materials and textures are
  *  sent once and again only when their version changes; transforms, instances, lights and the
@@ -28,7 +29,7 @@ import {backdropMatrix, drawsThrough, flushDrawOrders, noteDrawOrder, setDrawEye
 const sink = (): SceneSink | undefined => host.sink;
 
 // Record kinds in the frame stream. Keep in sync with JsgbSceneMirror.cpp.
-export const MESH = 1, INSTANCED = 2, LIGHT = 3, SPRITE = 4, POINTS = 5, LINES = 6, ASSET = 7, EFFECT = 8, SKELETAL = 12;
+export const MESH = 1, INSTANCED = 2, LIGHT = 3, SPRITE = 4, POINTS = 5, LINES = 6, ASSET = 7, EFFECT = 8, SKELETAL = 12, VIEWRECT = 13;
 export const HEADER_FLOATS = 88;
 const LIGHT_KIND: Record<string, number> = {DirectionalLight: 1, PointLight: 2, SpotLight: 3, AmbientLight: 4, HemisphereLight: 5, RectAreaLight: 6};
 
@@ -70,16 +71,22 @@ const geometryRefs = new Map<number, WeakRef<THREE.BufferGeometry>>();
 // Materials and textures sent to the host, so their Unreal copies are freed when the game disposes of them or drops them
 // (a fight makes new ones for every explosion, wreck and piece of debris; kept, they added about 2 GB a minute).
 const materialRefs = new Map<number, WeakRef<object>>(), textureRefs = new Map<number, WeakRef<object>>();
+// One dispose listener per object: a material disposed and used again is tracked again, and the listener stays.
+const listening = new WeakSet<object>();
 function track(refs: Map<number, WeakRef<object>>, thing: THREE.EventDispatcher<{dispose: object}> & object, id: number, kind: 'material' | 'texture') {
   if (refs.has(id)) return;
   refs.set(id, new WeakRef(thing));
+  if (listening.has(thing)) return;
+  listening.add(thing);
   // three.js lets a disposed material or texture be used again (it uploads it afresh), so everything that says
   // "already sent" is forgotten with it and a later use sends it again.
   thing.addEventListener('dispose', () => { if (!refs.delete(id)) return; forget(kind, id, thing); release(kind, id); });
 }
 function forget(kind: 'material' | 'texture', id: number, thing: object) {
   if (kind === 'texture') { textureSig.delete(id); textureOk.delete(id); pixelState.delete(thing as THREE.Texture); }
-  else { quick.delete(thing as THREE.Material); materialFrame.delete(thing as THREE.Material); }
+  // The description sent goes too: Unreal frees its copy, and an unchanged material would otherwise never be sent again
+  // (PrepViz's floor dots, disposed while drawn, lost their size in Unreal and grew to 50 cm discs).
+  else { quick.delete(thing as THREE.Material); materialFrame.delete(thing as THREE.Material); materialSig.delete(id); }
 }
 function release(kind: 'material' | 'texture', id: number) {
   const out = sink();
@@ -1015,6 +1022,7 @@ function emitPrimitive(o: THREE.Points | THREE.Line, kind: number, primitive: nu
     if (d !== geo) { geo = d; primitive = 2; }
   }
   const gid = syncGeometry(geo, primitive); if (!gid) return;
+  noteDrawOrder(idOf(o), o, true); // drawOrder.ts: lines keep three's renderOrder
   push(kind); push(idOf(o)); push(gid); push(syncMaterial(mat)); push(flagsOf(o)); pushMatrix(o.matrixWorld);
 }
 
@@ -1034,6 +1042,7 @@ function emitFatLine(o: THREE.Mesh) {
   m.depthTest = lm.depthTest; m.depthWrite = lm.depthWrite; m.blending = lm.blending; m.toneMapped = lm.toneMapped;
   m.userData.jsgbFatWidth = lm.linewidth ?? 1; m.userData.jsgbFatWorld = !!lm.worldUnits;
   const gid = syncGeometry(geometry, 2); if (!gid) return;
+  noteDrawOrder(idOf(o), o, true); // drawOrder.ts: a fat line's outline and core keep three's renderOrder
   push(LINES); push(idOf(o)); push(gid); push(syncMaterial(m)); push(flagsOf(o)); pushMatrix(o.matrixWorld);
 }
 
@@ -1206,12 +1215,24 @@ function walkObject(o: THREE.Object3D, cam: THREE.Camera, skipKey: string | null
   const ch = o.children; for (let i = 0; i < ch.length; i++) walk(ch[i], cam, childSkip);
 }
 
+/** The live view's canvas rectangle as a full-window frustum (viewRect.ts); null while its layout is unknown. */
+function viewRectFrustum(cam: THREE.PerspectiveCamera & THREE.OrthographicCamera, vfovDeg: number, orthoHalfH: number) {
+  const canvas = (lastFrame.renderer as Record<string, any> | null)?.domElement as Record<string, any> | undefined;
+  const r = canvas?.getBoundingClientRect?.() as {x: number; y: number; width: number; height: number} | undefined;
+  if (!r) return null;
+  const g = globalThis as Record<string, any>;
+  const rect: ViewRect = composeViewRect({x: r.x, y: r.y, w: r.width, h: r.height}, (cam as Record<string, any>).view);
+  return fullWindowFrustum(rect, Number(g.innerWidth) || 0, Number(g.innerHeight) || 0, vfovDeg, orthoHalfH);
+}
+
 let sweep = 0;
 /** Sends this frame to the host. Returns the number of floats written (0 when nothing to draw). */
 export function exportFrame(): number {
   const out = sink(); if (!out) return 0;
   let scene = lastFrame.scene as THREE.Scene | null;
   let cam = lastFrame.camera as THREE.PerspectiveCamera & THREE.OrthographicCamera | null;
+  // The window-filling view (not a render-target capture standing in for it) carries the view rectangle.
+  const liveView = !!(scene && cam);
   if (!scene || !cam) {
     // Before the game draws its view (a loading screen priming portraits), a scene read back from a render target
     // still goes out: an empty view with that capture's camera, then the capture.
@@ -1223,10 +1244,12 @@ export function exportFrame(): number {
   top.updateMatrixWorld();
   cam.updateMatrixWorld();
   n = 0; ni = 0; exportCount++; newShaderFrame();
+  const pageVfov = cam.isPerspectiveCamera ? cam.fov : 0;
+  const pageOrthoHalf = cam.isOrthographicCamera ? (cam.top - cam.bottom) / 2 / cam.zoom : 0;
   // Header (HEADER_FLOATS): camera, background, fog, environment, post-processing.
   pushMatrix(cam.matrixWorld);
-  push(cam.isPerspectiveCamera ? cam.fov : 0); push(cam.isPerspectiveCamera ? cam.aspect : (cam.right - cam.left) / Math.max(1e-6, cam.top - cam.bottom));
-  push(cam.near); push(cam.far); push(cam.isOrthographicCamera ? 1 : 0); push(cam.isOrthographicCamera ? (cam.top - cam.bottom) / 2 / cam.zoom : 0);
+  push(pageVfov); push(cam.isPerspectiveCamera ? cam.aspect : (cam.right - cam.left) / Math.max(1e-6, cam.top - cam.bottom));
+  push(cam.near); push(cam.far); push(cam.isOrthographicCamera ? 1 : 0); push(pageOrthoHalf);
   const sc = top as THREE.Scene;
   const bg = sc.background as (THREE.Color & THREE.Texture) | null;
   push(bg?.isColor ? 1 : 0); push(bg?.isColor ? bg.r : 0); push(bg?.isColor ? bg.g : 0); push(bg?.isColor ? bg.b : 0);
@@ -1239,6 +1262,13 @@ export function exportFrame(): number {
   push(bloomLive ? post.bloomStrength : 0); push(post.bloomRadius); push(post.bloomThreshold);
   pushMatrix(cam.matrixWorldInverse); pushMatrix(cam.projectionMatrix); pushMatrix(cam.projectionMatrixInverse);
   if (n !== HEADER_FLOATS) throw Error('scene header layout changed');
+  // Record 13: the canvas rectangle as a full-window frustum (viewRect.ts), so the mirror renders the
+  // page camera into its rectangle of the window instead of across the window. First after the header;
+  // a mirror without it keeps the old full-window behaviour only by never seeing this runtime.
+  if (liveView) {
+    const full = viewRectFrustum(cam, pageVfov, pageOrthoHalf);
+    if (full) { push(VIEWRECT); push(full.vfovDeg); push(full.orthoHalfH); push(full.centerX); push(full.centerY); }
+  }
   // A texture background (an equirectangular sky): record 11 with the texture, its mapping, scene.backgroundIntensity,
   // the rotation three.js applies to the view direction (scene.backgroundRotation) and whether the image is flipped.
   if (bg?.isTexture) {

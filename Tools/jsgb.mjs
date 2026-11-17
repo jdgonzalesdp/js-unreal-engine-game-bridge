@@ -18,6 +18,7 @@ import {unicodeRegexPlugin, rewriteUnicodePropertyRegexes} from './unicode-regex
 import {injectUnicodeProperties} from './unicode-props.mjs';
 import {viteAssets, rebaseCssUrls} from './vite-assets.mjs';
 import {sceneFps} from './game-frame-rate.mjs';
+import {publishLoading} from './loading-screen.mjs';
 
 const bridge = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtime = path.join(bridge, 'Runtime');
@@ -437,7 +438,9 @@ export async function build(game) {
     // The page's address and its sign-in returns (Source/JsGameBridge/Private/JsgbAddress.cpp, Runtime/src/location.ts).
     origin: game.origin ?? '', callbackPaths: game.callbackPaths ?? [], gameTitle: game.title ?? page.title,
     // The default frame cap of the mirrored scene (Tools/game-frame-rate.mjs, Source/JsGameBridge/Private/JsgbFrameCap.h).
-    sceneFps: sceneFps(game)};
+    sceneFps: sceneFps(game),
+    // The loading screen's look (Tools/loading-screen.mjs); absent for a game that keeps the host's own.
+    loading: publishLoading(game, bridge)};
   fs.writeFileSync(path.join(game.out, 'publication.json'), JSON.stringify(publication, null, 1));
   console.log(`built ${game.id}: ${publication.modules} modules, ${(bundle.length / 1e6).toFixed(1)} MB, ${publication.buildMilliseconds} ms -> ${bundlePath}`);
   return publication;
@@ -453,7 +456,8 @@ async function buildPage(game) {
   const publication = {version: 1, game: game.id, sourceCommit: git(game.repo, 'rev-parse', 'HEAD') || '0'.repeat(40),
     sourceDirty: !!git(game.repo, 'status', '--porcelain', '--untracked-files=no'), bridgeCommit: git(bridge, 'rev-parse', 'HEAD'),
     page: game.index ?? 'index.html', buildMilliseconds: Math.round(performance.now() - started),
-    publicRoots: [path.join(game.out, 'web'), ...(game.public ?? ['public']).map(p => path.resolve(game.repo, p))], search: game.search ?? '', title: page.title};
+    publicRoots: [path.join(game.out, 'web'), ...(game.public ?? ['public']).map(p => path.resolve(game.repo, p))], search: game.search ?? '', title: page.title,
+    loading: publishLoading(game, bridge)};
   fs.writeFileSync(path.join(game.out, 'publication.json'), JSON.stringify(publication, null, 1));
   console.log(`built ${game.id} as a page game in ${publication.buildMilliseconds} ms -> ${path.join(game.out, 'web')}`);
   return publication;

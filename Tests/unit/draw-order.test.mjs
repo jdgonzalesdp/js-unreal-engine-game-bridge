@@ -44,6 +44,17 @@ test('the opaque list sorts under the transparent one, and group order outranks 
   assert.deepEqual(events, []);
 });
 
+test('every line takes a priority, so an outline remade after its core still draws under it', () => {
+  const line = (renderOrder, opts = {}) => { const l = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial(opts)); l.renderOrder = renderOrder; return l; };
+  const events = [];
+  order.noteDrawOrder(41, line(965.01, {transparent: true}), true); order.noteDrawOrder(40, line(965, {transparent: true}), true);
+  order.noteDrawOrder(42, line(0), true);
+  order.flushDrawOrders(e => events.push(e));
+  const p = Object.fromEntries(events.map(e => [e.id, e.priority]));
+  assert.ok(p[41] > p[40] && p[40] > 0, `core ${p[41]} over outline ${p[40]}`);
+  assert.ok(p[42] < 0, 'an opaque line keeps three\'s opaque-first order');
+});
+
 test('depthFunc AlwaysDepth and depthTest false both draw through', () => {
   assert.equal(order.drawsThrough(new THREE.MeshBasicMaterial({depthFunc: THREE.AlwaysDepth})), true);
   assert.equal(order.drawsThrough(new THREE.MeshBasicMaterial({depthTest: false})), true);

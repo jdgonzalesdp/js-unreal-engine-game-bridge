@@ -8,7 +8,9 @@
 #include "JsgbBridge.h"
 #include "JsgbLines.h"
 #include "JsgbDrawOrder.h"
+#include "JsgbPointSize.h"
 #include "JsgbPostProcess.h"
+#include "JsgbCameraComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/SkeletalMesh.h"
 #include "Components/PoseableMeshComponent.h"
@@ -82,7 +84,7 @@ namespace
 {
 	constexpr float Cm = 100.f;
 	constexpr int32 HeaderFloats = 88;
-	enum ERecord { RMesh = 1, RInstanced = 2, RLight = 3, RSprite = 4, RPoints = 5, RLines = 6, RAsset = 7, REffect = 8, RCapture = 9, RCaptureEnd = 10, RBackground = 11, RSkeletal = 12 };
+	enum ERecord { RMesh = 1, RInstanced = 2, RLight = 3, RSprite = 4, RPoints = 5, RLines = 6, RAsset = 7, REffect = 8, RCapture = 9, RCaptureEnd = 10, RBackground = 11, RSkeletal = 12, RViewRect = 13 };
 	enum EVariant { VLit, VLit2S, VMasked, VTrans, VUnlit, VUnlitTrans, VAdditive, VUnlitMasked, VBillboard, VBillboardAdd, VCount };
 	const TCHAR* VariantPaths[VCount] = {
 		TEXT("/JsGameBridge/Mirror/M_JsgbLit.M_JsgbLit"), TEXT("/JsGameBridge/Mirror/M_JsgbLit2S.M_JsgbLit2S"), TEXT("/JsGameBridge/Mirror/M_JsgbMasked.M_JsgbMasked"),
@@ -1274,6 +1276,17 @@ void UJsgbSceneMirror::ApplyLight(const float* S, uint32 FrameStamp, FLinearColo
 	ULightComponent* C = L.Component;
 	L.Seen = FrameStamp;
 	if (L.Capture != Capture) { L.Capture = Capture; C->SetLightingChannels(Capture == 0, Capture != 0, false); }
+	// Native sun/sky: the directional light travelling along the streamed sun direction is the main sun;
+	// the host's native sun draws it instead. Added suns (any other direction) keep mirroring.
+	if (bNativeSun && Kind == 1)
+	{
+		const FVector RecordDir = FVector(S[10], S[11], S[12]).GetSafeNormal();
+		if (!RecordDir.IsNearlyZero() && FVector::DotProduct(RecordDir, NativeSunDir.GetSafeNormal()) > 0.999)
+		{
+			if (C->IsVisible()) { C->SetVisibility(false); }
+			return;
+		}
+	}
 	if (!C->IsVisible()) { C->SetVisibility(true); }
 	C->SetLightColor(Color, true);
 	C->SetIntensity(Intensity);
@@ -1284,6 +1297,19 @@ void UJsgbSceneMirror::ApplyLight(const float* S, uint32 FrameStamp, FLinearColo
 		UDirectionalLightComponent* Sun = Cast<UDirectionalLightComponent>(C);
 		const float Angle = bLumen ? SunSourceAngle : GetDefault<UDirectionalLightComponent>()->LightSourceAngle;
 		if (Sun->LightSourceAngle != Angle) { Sun->SetLightSourceAngle(Angle); Sun->SetVolumetricScatteringIntensity(1.f); }
+		// A shadow-casting sun gets a fitted cascade setup instead of the defaults (400 m at bias 0.5):
+		// at that scale thin walls cast nothing the filtering keeps, and sunlight read as shining
+		// through them. 150 m in four cascades, a small bias, and contact shadows to seal wall bases.
+		if (S[17] > 0.5f)
+		{
+			if (Sun->DynamicShadowDistanceMovableLight != 15000.f) { Sun->SetDynamicShadowDistanceMovableLight(15000.f); }
+			if (Sun->DynamicShadowCascades != 4) { Sun->SetDynamicShadowCascades(4); }
+			if (Sun->ShadowBias != 0.1f) { Sun->SetShadowBias(0.1f); }
+			// A low sun (magic hour, a few degrees up) makes slope bias open scalloped leaks along wall
+			// bases; keep it small and let the contact shadows seal the seam instead.
+			if (Sun->ShadowSlopeBias != 0.2f) { Sun->SetShadowSlopeBias(0.2f); }
+			if (Sun->ContactShadowLength <= 0.f) { Sun->ContactShadowLength = 0.08f; Sun->MarkRenderStateDirty(); }
+		}
 	}
 	const FVector Loc(Pos(&S[7]));
 	const FVector Forward(Dir(&S[10]));
@@ -1510,18 +1536,53 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 	}
 	QueueMs += (FPlatformTime::Seconds() - T0) * 1000.0;
 
+	// The view rectangle (record 13, first after the header): the page camera's frustum expanded to the
+	// full window with its centre in window NDC, so the page view renders into its canvas rectangle of
+	// the window instead of across it (Runtime viewRect.ts). Absent (an older bundle): the page camera
+	// fills the window, as before.
+	int32 RectFloats = 0;
+	float RectVfov = 0, RectOrthoHalf = 0;
+	FVector2D RectCenter = FVector2D::ZeroVector;
+	if (Count >= HeaderFloats + 5 && static_cast<int32>(D[HeaderFloats]) == RViewRect)
+	{
+		RectFloats = 5;
+		RectVfov = D[HeaderFloats + 1];
+		RectOrthoHalf = D[HeaderFloats + 2];
+		RectCenter = FVector2D(D[HeaderFloats + 3], D[HeaderFloats + 4]);
+	}
+	const bool bRect = RectFloats > 0;
+	// The rectangle itself, recovered from the expanded frustum (the record's inverse; viewRect.ts), for
+	// the host's blackout bars outside the canvas.
+	bViewRectCss = false;
+	if (bRect && ViewportSize.Y > 0 && PixelScale > 0.f)
+	{
+		const double WinW = ViewportSize.X / double(PixelScale), WinH = ViewportSize.Y / double(PixelScale);
+		double ScaleY = 1.0;
+		if (D[20] > 0.5f) { if (D[21] > 1e-6f && RectOrthoHalf > 0) { ScaleY = RectOrthoHalf / D[21]; } }
+		else if (D[16] > 0 && RectVfov > 0) { ScaleY = FMath::Tan(FMath::DegreesToRadians(double(RectVfov)) * 0.5) / FMath::Tan(FMath::DegreesToRadians(double(D[16])) * 0.5); }
+		if (ScaleY > 1e-6)
+		{
+			const double RectH = WinH / ScaleY, RectW = RectH * FMath::Max(0.1f, D[17]);
+			ViewRectCss = FVector4((RectCenter.X + 1.0) * 0.5 * WinW - RectW * 0.5, (1.0 - RectCenter.Y) * 0.5 * WinH - RectH * 0.5, RectW, RectH);
+			WindowCss = FVector2D(WinW, WinH);
+			bViewRectCss = true;
+		}
+	}
+
 	// Camera.
 	const float* E = D;
 	CameraLocation = FVector(E[12] * Cm, E[14] * Cm, E[13] * Cm);
 	const FVector Forward(-E[8], -E[10], -E[9]);
 	const FVector Up(E[4], E[6], E[5]);
 	CameraRotation = FRotationMatrix::MakeFromXZ(Forward, Up).Rotator();
-	const float VFov = D[16];
+	const float VFov = bRect && RectVfov > 0 ? RectVfov : D[16];
+	const float OrthoHalf = bRect ? RectOrthoHalf : D[21];
 	const float ViewAspect = ViewportSize.Y > 0 ? static_cast<float>(ViewportSize.X) / ViewportSize.Y : FMath::Max(0.1f, D[17]);
 	CameraHFov = VFov > 0 ? FMath::RadiansToDegrees(2.f * FMath::Atan(FMath::Tan(FMath::DegreesToRadians(VFov) * 0.5f) * ViewAspect)) : 90.f;
 	const float TanHalf = VFov > 0 ? FMath::Tan(FMath::DegreesToRadians(VFov) * 0.5f) : 0.5f;
 	if (Camera)
 	{
+		if (UJsgbCameraComponent* JC = Cast<UJsgbCameraComponent>(Camera)) { JC->ViewCenterNdc = RectCenter; }
 		if (bInterpolate)
 		{
 			// The camera glides like the objects; a cut is relative to the view distance (at least 50 m).
@@ -1536,11 +1597,15 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 			Camera->SetWorldLocationAndRotation(CameraFrom.GetLocation(), CameraFrom.Rotator());
 		}
 		else { Camera->SetWorldLocationAndRotation(CameraLocation, CameraRotation); }
-		if (D[20] > 0.5f) { Camera->SetProjectionMode(ECameraProjectionMode::Orthographic); Camera->SetOrthoWidth(D[21] * 2.f * Cm); /* the view keeps its vertical extent (Maintain Y FOV), so this is the visible height */ Camera->SetOrthoNearClipPlane(D[18] * Cm); Camera->SetOrthoFarClipPlane(D[19] * Cm);
+		if (D[20] > 0.5f) { Camera->SetProjectionMode(ECameraProjectionMode::Orthographic); Camera->SetOrthoWidth(OrthoHalf * 2.f * Cm); /* the view keeps its vertical extent (Maintain Y FOV), so this is the visible height */ Camera->SetOrthoNearClipPlane(D[18] * Cm); Camera->SetOrthoFarClipPlane(D[19] * Cm);
 			// The page's own near and far planes, and no plane correction: with Unreal's defaults an orthographic view
 			// is moved onto a line through the view target (this host actor at the origin), so a top view's pans and
 			// scrolls never moved the picture even though the camera did.
-			Camera->SetAutoCalculateOrthoPlanes(false); Camera->SetUpdateOrthoPlanes(false); }
+			Camera->SetAutoCalculateOrthoPlanes(false); Camera->SetUpdateOrthoPlanes(false);
+			// And no camera-height correction: Unreal's projection for a viewport still moves an orthographic view forward
+			// by min(camera height, half its width) (SceneView.cpp UpdateOrthoPlanes), whatever bUpdateOrthoPlanes says. A
+			// top view 50 m up that showed more than 100 m across put its near plane on the floor and drew nothing.
+			Camera->SetUseCameraHeightAsViewTarget(false); }
 		else { Camera->SetProjectionMode(ECameraProjectionMode::Perspective); Camera->SetFieldOfView(CameraHFov); }
 		ApplyPost(D);
 	}
@@ -1551,7 +1616,7 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 	auto OverrideKey = [this](int32 KeyId) { const FString* Name = KeyNames.Find(KeyId); return Name && Name->StartsWith(TEXT("override:")); };
 	// A hull whose override materials were released (Lumen off) and whose component kept the mesh gets them again.
 	auto MaterialsReleased = [this](int32 KeyId) { const FString* Name = KeyNames.Find(KeyId); return Name && !OverrideMaterials.Contains(*Name); };
-	int32 K = HeaderFloats;
+	int32 K = HeaderFloats + RectFloats;
 	int32 Drawn = 0;
 	auto SetSlots = [this](FJsgbEntity& Ent, UStaticMeshComponent* C, int32 Slots, const float* Mats, int32 NumMats)
 	{
@@ -1571,6 +1636,8 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 		if (C->CastShadow != bShadow) { C->SetCastShadow(bShadow); }
 		// Surfaces three.js draws without fog mark themselves in the custom stencil for the scene post.
 		const FJsgbMaterial* First = Ent.Materials.Num() ? Materials.Find(Ent.Materials[0]) : nullptr;
+		// Native sky: the game's sky dome (drawn first, without depth) gives way to SkyAtmosphere.
+		if (bNativeSky && First && First->bDrawFirst && C->Bounds.SphereRadius > 5000.f) { if (C->IsVisible()) { C->SetVisibility(false); } Ent.Seen = Stamp; return; }
 		const bool bNoFog = First && First->bNoFog;
 		if (C->bRenderCustomDepth != bNoFog) { C->SetRenderCustomDepth(bNoFog); C->SetCustomDepthStencilValue(bNoFog ? 1 : 0); }
 		// A surface drawn first without depth (a sky dome) sorts behind every other translucent surface.
@@ -1814,9 +1881,11 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 				if (G && !G->Mesh) { FirstBuild(Geo, G); }
 				if (!G || !G->Mesh) { ++SkippedEntities; TraceRecord(Id, 2, TEXT("point mesh could not be built")); continue; }
 				Mesh = G->Mesh; Revision = G->BuiltRevision;
-				const float Size = MatInfo ? MatInfo->Size : 1.f;
-				// three.js: attenuated points are size * tan(fov/2) world units across; others are pixels.
-				if (!MatInfo || MatInfo->bSizeAttenuation) { SizeX = SizeY = Size * TanHalf * Cm; Mode = 0; } else { SizeX = SizeY = Size; Mode = 1; }
+				// The size lives in the material: without it a guess drew PrepViz's 6 cm floor dots as 50 cm discs.
+				if (!MatInfo) { ++SkippedEntities; TraceRecord(Id, 2, TEXT("points material was never sent")); continue; }
+				// World size with attenuation in perspective, page pixels otherwise (JsgbPointSize.h).
+				const FJsgbPointSize Sized = JsgbPointSize::Compute({D[20] > 0.5f, OrthoHalf * Cm, TanHalf, static_cast<double>(ViewportSize.Y), PixelScale}, MatInfo->Size, MatInfo->bSizeAttenuation);
+				SizeX = SizeY = Sized.Size; Mode = Sized.Mode;
 			}
 			if (Defer(Id)) { continue; }
 			FJsgbEntity& Ent = EntityOf(Id, Type);
@@ -1982,6 +2051,7 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 			ApplyBackground(&D[K]);
 			K += 15;
 		}
+		else if (Type == RViewRect) { K += 5; } // read before the camera; never mid-stream, but never fatal
 		else
 		{
 			UE_LOG(LogJsgbMirror, Warning, TEXT("Unknown record %d at %d of %d"), Type, K, Count);
@@ -2001,14 +2071,15 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 	}
 	// Lines in three.js's transparent order: farthest first, equal distances by object id.
 	const double LinesStart = FPlatformTime::Seconds();
-	FrameLines.Sort([](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key != B.Key ? A.Key > B.Key : A.Value < B.Value; });
+	// three's draw order first (JsgbDrawOrder.h: a line's outline under its core, whichever was made last), then far to near.
+	FrameLines.Sort([this](const TPair<double, int32>& A, const TPair<double, int32>& B) { const int32 PA = JsgbDrawOrder::Priority(this, A.Value, 0), PB = JsgbDrawOrder::Priority(this, B.Value, 0); return PA != PB ? PA < PB : A.Key != B.Key ? A.Key > B.Key : A.Value < B.Value; });
 	{
 		// Unreal draws zero-width batched lines opaque, ignoring alpha; lines with a width are alpha-blended
 		// quads, so each line gets the world width of its pixels (JsgbLines.cpp places them).
 		const bool bOrtho = D[20] > 0.5f;
 		// A CSS pixel, the unit of the page's line widths: PixelScale device pixels on a Retina Mac.
 		const double CssHeight = FMath::Max(1.0, ViewportSize.Y / double(FMath::Max(1.f, PixelScale)));
-		const double PixelPerCm = bOrtho ? 2.0 * D[21] * Cm / CssHeight : 2.0 * TanHalf / CssHeight;
+		const double PixelPerCm = bOrtho ? 2.0 * OrthoHalf * Cm / CssHeight : 2.0 * TanHalf / CssHeight;
 		// Line widths follow view depth and the part of each line in frame, so the key holds the view direction and frame size.
 		FString Order = FString::Printf(TEXT("%.1f,%.1f,%.1f,%dx%d,%g,%s|"), CameraLocation.X, CameraLocation.Y, CameraLocation.Z, ViewportSize.X, ViewportSize.Y, PixelPerCm, *Forward.ToString());
 		for (const TPair<double, int32>& P : FrameLines) { const FJsgbEntity* LineEnt = Entities.Find(P.Value); Order += FString::Printf(TEXT("%d:%u:%g,"), P.Value, LineEnt ? LineEnt->LineSignature : 0u, LineEnt ? LineEnt->LineWidth : 1.f); }
