@@ -3,6 +3,10 @@
 import {frameCount} from './frameCount';
 import {objectId} from './sceneExport';
 import {host} from './host';
+import {noteDraw, readTargetPixels, READBACK_EXTENSIONS} from './readback';
+import {notePassDraw, noteViewDraw} from './postPasses';
+import {noteViewTake, noteScreenDraw} from './viewTake';
+import {passReadAsync} from './passRun';
 
 const g = globalThis as Record<string, any>;
 const COMPRESSED = new Set(['EXT_texture_compression_bptc', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb']);
@@ -22,6 +26,8 @@ export const lastFrame: {scene: unknown; camera: unknown; frame: number; rendere
 /** Post-processing the game asked for, read from its renderer and full-screen passes. */
 export const post: Record<string, number> = {exposure: 1, toneMapping: 0, bloomStrength: 0, bloomRadius: 0, bloomThreshold: 1, bloomFrame: -1};
 const renderers: Record<string, any>[] = [];
+/** The renderers the page made, for the bridge's /bridge/eval inspection. */
+export const liveRenderers = () => renderers.slice();
 /** Scenes the game draws into render targets, by target: the latest scene and camera, and the animation frame. */
 /** The game's view before a render into each target took its place (undone when the target turns out to be read). */
 const beforeTarget = new WeakMap<object, {scene: unknown; camera: unknown}>();
@@ -55,7 +61,17 @@ export class UnrealRenderer {
       memory: {geometries: 0, textures: 0, programs: 0},
       reset() { this.render.calls = this.render.triangles = this.render.points = this.render.lines = 0; },
     };
-    const gl = new Proxy({}, {get: (_t, k) => k === 'getParameter' ? () => 0 : k === 'getExtension' ? () => null : k === 'getContextAttributes' ? () => ({alpha: false, antialias: true}) : k === 'isContextLost' ? () => false : k === 'drawingBufferWidth' ? width : k === 'drawingBufferHeight' ? height : () => undefined});
+    // The context: what the page sets on it stays (a draw counter wraps drawElements on the context itself), symbols a
+    // page uses to tag it read as unset, and any other method does nothing.
+    const gl = new Proxy({} as Record<string | symbol, unknown>, {get: (t, k) => k in t ? t[k] : typeof k === 'symbol' ? undefined : k === 'getParameter' ? () => 0 : k === 'getExtension' ? () => null : k === 'getContextAttributes' ? () => ({alpha: false, antialias: true}) : k === 'isContextLost' ? () => false : k === 'drawingBufferWidth' ? width : k === 'drawingBufferHeight' ? height : () => undefined});
+    /** One drawElements per object the view draws, as WebGL makes them, so the page's own draw counters read true. */
+    const countDraws = (scene: Record<string, any>) => {
+      let calls = 0;
+      scene.traverseVisible?.((o: Record<string, any>) => { if (o.isMesh || o.isLine || o.isPoints || o.isSprite) calls += Array.isArray(o.material) ? o.material.length : 1; });
+      info.render.calls += calls;
+      const draw = (gl as Record<string, unknown>).drawElements as (...a: unknown[]) => unknown;
+      for (let i = 0; i < calls; i++) draw.call(gl);
+    };
     const base: Record<string, unknown> = {
       isWebGLRenderer: true, isUnrealRenderer: true, domElement: canvas,
       autoClear: true, autoClearColor: true, autoClearDepth: true, autoClearStencil: true, sortObjects: true,
@@ -70,7 +86,7 @@ export class UnrealRenderer {
         textureFormatReadable: () => true, textureTypeReadable: () => true},
       // The GPU formats Unreal uploads as they are, as a desktop browser reports them: KTX2 and Basis
       // textures then arrive as BC7 or DXT instead of 4x larger RGBA.
-      extensions: {get: (name: string) => COMPRESSED.has(name) ? {} : null, has: (name: string) => COMPRESSED.has(name), init() {}},
+      extensions: {get: (name: string) => COMPRESSED.has(name) || READBACK_EXTENSIONS.has(name) ? {} : null, has: (name: string) => COMPRESSED.has(name) || READBACK_EXTENSIONS.has(name), init() {}},
       properties: {get: (o: Record<string, unknown>) => (o.__jsgbProps ??= {}), remove() {}, update() {}, dispose() {}},
       state: deepNoop(),
       info,
@@ -97,16 +113,24 @@ export class UnrealRenderer {
       getActiveCubeFace: () => 0, getActiveMipmapLevel: () => 0,
       render: (scene: Record<string, any>, camera: Record<string, any>) => {
         info.render.frame++;
+        noteDraw(self, target as Record<string, any> | null, scene, camera); // readback.ts: what each read would show
         // A scene drawn into a render target by any renderer is remembered, so a later pixel read can capture it.
         const rt = target as Record<string, any> | null;
         if (rt?.texture && scene?.isScene) captures.set(rt, {scene, camera, frame: frameCount.animation});
         if (self !== mainRenderer()) return;
         g.__jsgbCanvas = canvas;
+        if (!target) noteScreenDraw(); // viewTake.ts: a view taken by a render target draw reached the screen
         // three.js tone maps (and applies exposure) only when drawing to the screen, or in an OutputPass that does it for
         // a post-processing chain. A view drawn into a render target and shown by plain shader passes is never tone
         // mapped (Hard Burn's pixel mode), so Unreal's tone curve and exposure stay off for it.
         const toneMapped = (on: boolean) => { post.exposure = on ? (self as Record<string, any>).toneMappingExposure ?? 1 : 1; post.toneMapping = on ? (self as Record<string, any>).toneMapping ?? 0 : 0; };
+        // A post-processing pass drawn as a scene (pmndrs postprocessing: one fullscreen triangle or quad under an
+        // orthographic camera) is a pass like three's own FullScreenQuad, never the view: in an orthographic view (a
+        // top view) the last pass to the screen took the view's place and the screen went black.
+        const only = scene?.isScene && camera?.isOrthographicCamera && scene.children?.length === 1 ? scene.children[0] : null;
+        if (only?.isMesh && only.frustumCulled === false && (only.geometry?.attributes?.position?.count ?? 99) <= 4) scene = only;
         if (!scene?.isScene) {
+          if (scene?.isMesh) notePassDraw(scene.material, target as Record<string, any> | null); // postPasses.ts: the composer chain
           if (scene?.material?.name === 'OutputShader' || scene?.material?.uniforms?.toneMappingExposure) toneMapped(true);
           // linear: drawn into a render target. A pass drawn straight to the screen writes display (sRGB) values.
           if (scene?.isGroup && camera?.layers) passRoots.set(scene, {mask: camera.layers.mask, frame: frameCount.animation, linear: !!target});
@@ -128,12 +152,12 @@ export class UnrealRenderer {
         const perspective = !!camera?.isPerspectiveCamera;
         // The scene Unreal mirrors: a perspective render, or an orthographic one in a frame without one. Within a
         // frame, an orthographic pass after the perspective scene is a HUD or overlay, not the view.
-        if (perspective || perspectiveFrame !== frameCount.animation) { lastFrame.scene = scene; lastFrame.camera = camera; lastFrame.renderer = self; lastFrame.linear = !!t; lastFrame.pointScale = t?.height > 0 ? Math.max(1, height * pixelRatio / t.height) : 1; lastFrame.frame++; toneMapped(!t); }
+        if (perspective || perspectiveFrame !== frameCount.animation) { noteViewTake(t); lastFrame.scene = scene; lastFrame.camera = camera; lastFrame.renderer = self; lastFrame.linear = !!t; lastFrame.pointScale = t?.height > 0 ? Math.max(1, height * pixelRatio / t.height) : 1; lastFrame.frame++; toneMapped(!t); countDraws(scene); noteViewDraw(t); }
         if (perspective) perspectiveFrame = frameCount.animation;
       },
       compile: () => new Set(), compileAsync: async () => {},
       setAnimationLoop: (fn: ((t: number) => void) | null) => { if (fn) { const loop = (t: number) => { fn(t); g.requestAnimationFrame(loop); }; g.requestAnimationFrame(loop); } },
-      readRenderTargetPixels() {}, readRenderTargetPixelsAsync: (t: unknown, x: number, y: number, w: number, h: number, buffer?: ArrayLike<number>) => readCapturePixels(t as Record<string, any>, x, y, w, h, buffer),
+      readRenderTargetPixels: (t: Record<string, any>, x: number, y: number, w: number, h: number, buffer?: ArrayLike<number>) => { readTargetPixels(t, x, y, w, h, buffer); }, readRenderTargetPixelsAsync: (t: unknown, x: number, y: number, w: number, h: number, buffer?: ArrayLike<number>) => passReadAsync(t as Record<string, any>, x, y, w, h, buffer) ?? readCapturePixels(t as Record<string, any>, x, y, w, h, buffer),
       copyFramebufferToTexture() {}, copyTextureToTexture() {}, copyTextureToTexture3D() {}, initTexture() {}, initRenderTarget() {},
       resetState() {}, dispose() {}, forceContextLoss() {}, clear() {}, clearColor() {}, clearDepth() {}, clearStencil() {},
       setViewport() {}, setScissor() {}, setScissorTest() {}, setOpaqueSort() {}, setTransparentSort() {}, renderBufferDirect() {},

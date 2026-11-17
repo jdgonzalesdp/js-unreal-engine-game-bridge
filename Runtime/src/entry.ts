@@ -1,21 +1,38 @@
 /** JsGameBridge entry. Installs the browser environment, then boots the unchanged game entry that
  *  the build resolves as 'jsgb:game'. The host drives everything through `globalThis.__jsgb`. */
+import './unicodeRegExp';
 import {seedRandom} from './seed';
 import './polyfills';
+import './subtle';
+import './urlLive';
+import './locks';
+import './sdfCanvas';
 import {host} from './host';
-import {pumpFrame, pendingTimers, pumpTiming, wallNow} from './timers';
-import {setViewport} from './dom';
+import {pumpFrame, pendingTimers, pumpTiming, wallNow, runTimers, immediatesPending} from './timers';
+import {setViewport, flushStorage} from './dom';
+import './webGaps';
+import './bitmapCopy';
+import {leaveStep, onLeaveBusy} from './leave';
+// IndexedDB, restored from the host's store before the game's module runs.
+import './indexedDb';
+import {navigateTo} from './location';
 import './fetch';
 import {flushAudio, audioTime} from './audio';
 import './worker';
 import './display';
+import './frameRate';
 import {refreshGraphics} from './graphics';
 import './text';
+// Exports: pictures of the scene, image files, video encoding and saved files.
+import './canvasRead';
+import './webcodecs';
+import './download';
 import {input} from './input';
 import {publishUI, uiInput, clickElement, findElement} from './ui';
-import {lastFrame, post} from './renderer';
+import {lastFrame, liveRenderers, post} from './renderer';
 import {exportFrame, describeScene, emitEvent, objectById, exportStats} from './sceneExport';
 import {cameraFrameStart, cameraFrameEnd} from './cameraRig';
+import {endFrameView} from './viewTake';
 
 const g = globalThis as Record<string, any>;
 for (const level of ['log', 'info', 'debug', 'warn', 'error'] as const) {
@@ -39,6 +56,7 @@ g.__jsgb = {
     const t1 = wallNow();
     refreshGraphics();
     cameraFrameEnd();
+    endFrameView(); // viewTake.ts: a render target draw that took the view and never reached the screen gives it back
     try { exportFrame(); } catch (e) { host.log('error', 'scene export: ' + (e instanceof Error ? e.stack : e)); }
     const t2 = wallNow();
     try { publishUI(); } catch (e) { host.log('error', 'ui publish: ' + (e instanceof Error ? e.stack : e)); }
@@ -59,14 +77,20 @@ g.__jsgb = {
       host.log('log', `slow js frame ${frames}: ${t4 - t0} ms = worker replies ${p.workersMs} (${p.workerReplies}) + timers ${p.timersMs} (${p.timerCalls} calls, slowest ${p.slowestMs} ms in ${p.slowest}) + animation frame ${p.rafMs} (${p.rafCalls} callbacks) + scene export ${t2 - t1} + ui ${t3 - t2} + audio ${t4 - t3}`);
     }
   },
-  input, ui: uiInput, publish: () => publishUI(0), viewport: setViewport, emit: emitEvent,
+  input, ui: uiInput, publish: () => publishUI(0), viewport: setViewport, emit: emitEvent, navigate: navigateTo,
+  /** The host is about to stop the page (quit, end of play, hot reload): one step of leaving it (leave.ts). The host
+   *  calls it until it answers true, then once with force when its time is up. */
+  leave: (force = false) => leaveStep(flushStorage, () => { void runTimers(4); }, force),
   click: clickElement, find: (what: string) => !!findElement(what),
   key: (code: string, how = 'press') => { if (how !== 'up') input.key('keydown', code); if (how !== 'down') input.key('keyup', code); return code; },
-  pendingTimers, lastFrame, post, describeScene, objectById, exportStats,
+  pendingTimers, lastFrame, liveRenderers, post, describeScene, objectById, exportStats,
   get frames() { return frames; },
   get booted() { return booted; },
   get bootError() { return bootError; },
 };
+
+// A leave waits while IndexedDB has steps queued (fake-indexeddb runs them through setImmediate).
+onLeaveBusy(immediatesPending);
 
 // Scripts can re-seed later (seed <n>) so both runs share the moment the world is built.
 // A script's "seed <n>" re-seeds when the next click event starts, after pointer/mouse handlers,

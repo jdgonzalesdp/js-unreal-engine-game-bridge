@@ -1,6 +1,8 @@
 /** A byte encoding for worker messages (the structured-clone subset workers use: plain data, arrays,
  *  maps, sets, dates, ArrayBuffers and their views), so worker results can be cached across a hot
- *  reload. encode returns null for anything else (functions, class instances, bitmaps). */
+ *  reload. ImageBitmaps travel with their pixels (bitmapClone.ts). encode returns null for anything else (functions,
+ *  other class instances). */
+import {encodeBitmap, decodeBitmap} from './bitmapClone';
 type Shape = null | boolean | number | string | Shape[] | {[k: string]: Shape};
 
 const VIEWS: Record<string, new (b: ArrayBuffer, o: number, n: number) => ArrayBufferView> = {
@@ -31,6 +33,7 @@ export function encode(value: unknown): Uint8Array | null {
     if (v instanceof Map) return {$: 'm', v: [...v].map(([k, x]) => [walk(k, depth + 1), walk(x, depth + 1)])};
     if (v instanceof Set) return {$: 's', v: [...v].map(x => walk(x, depth + 1))};
     if (v instanceof Date) return {$: 'd', v: v.getTime()};
+    const bitmap = encodeBitmap(v, bufferIndex); if (bitmap) return bitmap as unknown as Shape;
     const proto = Object.getPrototypeOf(v);
     if (proto !== Object.prototype && proto !== null) { ok = false; return null; }
     const out: {[k: string]: Shape} = {};
@@ -70,6 +73,7 @@ export function decode(bytes: ArrayBuffer, base = 0): unknown {
       case 'm': return new Map((v.v as Shape[][]).map(([k, x]) => [walk(k), walk(x)]));
       case 's': return new Set((v.v as Shape[]).map(walk));
       case 'd': return new Date(v.v as number);
+      case 'ib': return decodeBitmap(v as never, buffers);
     }
     const out: Record<string, unknown> = {};
     for (const [k, x] of Object.entries(v)) out[k === '$$' ? '$' : k] = walk(x);

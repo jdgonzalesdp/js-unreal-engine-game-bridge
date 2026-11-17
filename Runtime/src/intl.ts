@@ -149,8 +149,12 @@ class ListFormat {
   }
 }
 
+/** NumberFormat, DateTimeFormat and Collator also work without `new` in browsers (`Intl.DateTimeFormat().resolvedOptions()`). */
+const callable = <T extends new (...a: any[]) => object>(C: T) => new Proxy(C, {apply: (_t, _self, args) => new C(...args)}) as T;
+
 if (typeof g.Intl === 'undefined') {
-  g.Intl = {NumberFormat, DateTimeFormat, PluralRules, Collator, RelativeTimeFormat, ListFormat, getCanonicalLocales: () => ['en-US'], supportedValuesOf: () => []};
+  g.Intl = {NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), PluralRules, Collator: callable(Collator), RelativeTimeFormat,
+    ListFormat, getCanonicalLocales: () => ['en-US'], supportedValuesOf: () => []};
   const define = (o: object, k: string, f: unknown) => Object.defineProperty(o, k, {value: f, writable: true, configurable: true});
   define(Number.prototype, 'toLocaleString', function (this: number, _l?: unknown, o?: NumberOptions) { return formatNumber(Number(this), o); });
   define(BigInt.prototype, 'toLocaleString', function (this: bigint, _l?: unknown, o?: NumberOptions) { return formatNumber(Number(this), o); });

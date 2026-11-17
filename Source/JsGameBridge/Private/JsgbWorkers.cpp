@@ -10,6 +10,8 @@ THIRD_PARTY_INCLUDES_START
 #include "v8-profiler.h"
 THIRD_PARTY_INCLUDES_END
 #include "JsgbBridge.h"
+#include "JsgbNet.h"
+#include "JsgbWasmFeatures.h"
 #include "Misc/FileHelper.h"
 #include <mutex>
 #if PLATFORM_WINDOWS
@@ -107,6 +109,28 @@ namespace
 		v8::Isolate* I = Info.GetIsolate();
 		const TArray<uint8> Bytes = Info.Length() > 0 ? Self(Info)->ReadFile(ToString(I, Info[0])) : TArray<uint8>();
 		if (Bytes.Num()) { Info.GetReturnValue().Set(ArrayBufferOf(I, Bytes)); } else { Info.GetReturnValue().SetNull(); }
+	}
+	// The worker's network and secure randomness: the page's allow list and requests (JsgbNet.cpp), used by
+	// Runtime/src/workerRuntime.ts (fetch) and polyfills.ts (crypto.getRandomValues).
+	int32 IntOf(v8::Isolate* I, v8::Local<v8::Value> V) { return V->Int32Value(I->GetCurrentContext()).FromMaybe(0); }
+	void JsHttpStart(const v8::FunctionCallbackInfo<v8::Value>& Info)
+	{
+		v8::Isolate* I = Info.GetIsolate();
+		if (Info.Length() < 3) { Info.GetReturnValue().Set(0); return; }
+		const TArray<uint8> Body = Info.Length() > 3 ? BytesOf(Info[3]) : TArray<uint8>();
+		Info.GetReturnValue().Set(FJsgbNet::Start(ToString(I, Info[0]), ToString(I, Info[1]), ToString(I, Info[2]), Body.GetData(), Body.Num()));
+	}
+	void JsHttpTake(const v8::FunctionCallbackInfo<v8::Value>& Info)
+	{
+		v8::Isolate* I = Info.GetIsolate();
+		TArray<uint8> Reply;
+		if (Info.Length() > 0 && FJsgbNet::Take(IntOf(I, Info[0]), Reply)) { Info.GetReturnValue().Set(ArrayBufferOf(I, Reply)); } else { Info.GetReturnValue().SetNull(); }
+	}
+	void JsRandomBytes(const v8::FunctionCallbackInfo<v8::Value>& Info)
+	{
+		v8::Isolate* I = Info.GetIsolate();
+		TArray<uint8> Bytes;
+		if (Info.Length() > 0 && FJsgbNet::RandomBytes(IntOf(I, Info[0]), Bytes)) { Info.GetReturnValue().Set(ArrayBufferOf(I, Bytes)); } else { Info.GetReturnValue().SetNull(); }
 	}
 
 	bool RunScript(v8::Isolate* I, v8::Local<v8::Context> Ctx, const FString& Code, const FString& Name, FString& Error)
@@ -207,6 +231,7 @@ uint32 FJsgbWorker::Run()
 {
 	v8::Platform* Platform = static_cast<v8::Platform*>(IJsEnvModule::Get().GetV8Platform());
 	EnsureWorkerV8(Platform);
+	JsgbEnableWasmFeatures();
 	v8::Isolate::CreateParams Params;
 	Params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
 	v8::Isolate* I = v8::Isolate::New(Params);
@@ -228,6 +253,9 @@ uint32 FJsgbWorker::Run()
 		Global->Set(I, "__blobPut", v8::FunctionTemplate::New(I, &JsBlobPut, Data));
 		Global->Set(I, "__blobGet", v8::FunctionTemplate::New(I, &JsBlobGet, Data));
 		Global->Set(I, "__blobRevoke", v8::FunctionTemplate::New(I, &JsBlobRevoke, Data));
+		Global->Set(I, "__httpStart", v8::FunctionTemplate::New(I, &JsHttpStart, Data));
+		Global->Set(I, "__httpTake", v8::FunctionTemplate::New(I, &JsHttpTake, Data));
+		Global->Set(I, "__randomBytes", v8::FunctionTemplate::New(I, &JsRandomBytes, Data));
 		v8::Local<v8::Context> Ctx = v8::Context::New(I, nullptr, Global);
 		v8::Context::Scope ContextScope(Ctx);
 
@@ -304,12 +332,18 @@ FString UJsgbBridge::ProfileJs(const FString& Command)
 	{
 		v8::CpuProfile* Profile = GJsgbProfiler->StopProfiling(Title);
 		if (!Profile) { return TEXT("no profile"); }
+#if V8_MAJOR_VERSION >= 12
 		FJsgbProfileText Out;
 		Profile->Serialize(&Out);
 		Profile->Delete();
 		const FString File = Command.Mid(5).TrimStartAndEnd();
 		FFileHelper::SaveArrayToFile(Out.Bytes, *File);
 		return FString::Printf(TEXT("wrote %d bytes to %s"), Out.Bytes.Num(), *File);
+#else
+		// V8 before 12 (Puerts' 9.4 on a Mac) has no CpuProfile::Serialize.
+		Profile->Delete();
+		return TEXT("profile export needs V8 12 or later");
+#endif
 	}
 	return TEXT("use start or stop <file>");
 }

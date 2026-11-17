@@ -35,11 +35,34 @@ export interface JsgbHost {
    *  and RGBA float32 rows from the top, or null while not ready. */
   captureRead?(textureId: number): void;
   captureTake?(textureId: number): ArrayBuffer | null;
+  /** Network requests (netFetch.ts). start returns an id, or 0 when the host refuses the URL (an origin it doesn't
+   *  allow); take returns null while the request is in flight, then [status int32 (0 for a network error), headers
+   *  JSON byte length int32, headers JSON padded to 4, body]. */
+  httpStart?(method: string, url: string, headersJson: string, body: ArrayBuffer | null): number;
+  httpTake?(id: number): ArrayBuffer | null;
+  /** navigator.platform: "MacIntel" on a Mac, "Win32" on Windows. */
+  platform?: string;
+  /** What a browser takes from the system (Source/JsGameBridge/Private/JsgbSystem.h): alert, confirm and prompt as a native
+   *  dialog the call waits for (dialogs.ts), the clipboard (clipboard.ts), the light or dark look, read again now and
+   *  then (appearance.ts, mediaQueries.ts), and the time zone's IANA name (timeZones.ts). */
+  dialog?(kind: 'alert' | 'confirm' | 'prompt', message: string, value: string): string;
+  clipboard?: {types(): string; text(type: string): string; image(): ArrayBuffer | null; files?(): string; write(textsJson: string, png: ArrayBuffer | null): boolean};
+  colorScheme?: string | (() => string | undefined);
+  timeZone?: string;
+  /** `n` bytes from a secure random generator, for crypto.getRandomValues. */
+  randomBytes?(n: number): ArrayBuffer | null;
   /** Monotonic milliseconds. */
   now(): number;
   log(level: 'log' | 'warn' | 'error', text: string): void;
   /** location.search the web build would have (e.g. "?play"). */
   search: string;
+  /** The page's origin ("http://localhost:5180") and location.pathname at this start (location.ts). */
+  origin?: string;
+  path?: string;
+  /** The path and query the page starts at next time ("/scene/4?x=1"), kept across restarts. */
+  setAddress?(pathAndQuery: string): void;
+  /** Opens an http or https URL in the system browser; false when the host refuses it. */
+  openExternal?(url: string): boolean;
   /** Log each drawn object's identity the first time it is drawn (-JsgbTraceMirror). */
   trace?: boolean;
   /** Restart the whole game (location.reload). */
@@ -50,8 +73,11 @@ export interface JsgbHost {
   display?: {modes(): string; get(): string; set(json: string): void};
   /** Unreal graphics: the current state as JSON {lumen, available}, and a change as JSON (see graphics.ts). */
   graphics?: {get(): string; set(json: string): void};
-  /** Persistent key/value store for localStorage and sessionStorage. */
-  storage?: {load(key: string): string | null; save(key: string, data: string): void};
+  /** The most frames a second the game asks Unreal to present, 0 for no request (see frameRate.ts). */
+  frameRate?(fps: number): void;
+  /** Persistent key/value store for localStorage, sessionStorage and IndexedDB. remove deletes an entry's file (a host
+   *  without it gets an empty entry saved instead). */
+  storage?: {load(key: string): string | null; save(key: string, data: string): void | boolean; remove?(key: string): void};
   /** The host-driven camera rig (cameraRig.ts). */
   camera?: {take(): string; give(version: number, json: string): void; config(json: string): void; off(): void};
   /** Bytes that outlive a hot reload (the JS environment restarts, the host keeps them). */

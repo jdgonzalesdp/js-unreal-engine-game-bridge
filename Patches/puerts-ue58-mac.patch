@@ -1,0 +1,252 @@
+Puerts (the Unreal_v1.0.9 release's plugin folder) for UE 5.8 on a Mac:
+- JsEnv uses V8 9.4.146.24 (puerts/backend-v8 V8_9.4.146.24, which has macOS arm64 libraries; unpack its
+  v8_9.4.146.24 folder into ThirdParty/), linked statically in the editor too: the dylib build needs Chromium's
+  libc++, which the release doesn't ship, so the plugin fails to load.
+- the CSharpParamDefaultValueMetas UBT plugin builds on the engine's .NET, defines UE_5_5_OR_LATER, and drops a
+  Microsoft.CSharp reference that .NET 10 reports as an error.
+- UE 5.8 API changes: FLinearColor::QuantizeFloor, UField::Next as TObjectPtr, ProcessDelegate.
+Apply from inside the Puerts folder: git apply --ignore-whitespace <this file>
+
+--- a/Source/JsEnv/JsEnv.Build.cs
++++ b/Source/JsEnv/JsEnv.Build.cs
+@@ -22,7 +22,7 @@
+ 
+     private SupportedV8Versions UseV8Version = 
+ #if UE_4_25_OR_LATER
+-        SupportedV8Versions.V8_4_371_19;
++        SupportedV8Versions.V9_4_146_24;
+ #else
+         SupportedV8Versions.VDeprecated;
+ #endif
+@@ -38,6 +38,6 @@
+     private bool WithFFI = false;
+     
+-    private bool ForceStaticLibInEditor = false;
++    private bool ForceStaticLibInEditor = true;
+ 
+     private bool ThreadSafe = false;
+ 
+--- a/Source/CSharpParamDefaultValueMetas/CSharpParamDefaultValueMetas.ubtplugin.csproj
++++ b/Source/CSharpParamDefaultValueMetas/CSharpParamDefaultValueMetas.ubtplugin.csproj
+@@ -8,8 +8,6 @@
+     <EngineVersionFileContent >$([System.IO.File]::ReadAllText($(EngineVersionPath)))</EngineVersionFileContent >
+     <TargetFramework Condition="$(EngineVersionFileContent.Contains('++UE5+Release-5.5'))">net8.0</TargetFramework>
+     <TargetFramework Condition="!$(EngineVersionFileContent.Contains('++UE5+Release-5.5'))">net6.0</TargetFramework-->
+-    <TargetFramework Condition="Exists('$(EngineDir)\Binaries\ThirdParty\DotNet\8.0.300')">net8.0</TargetFramework>
+-    <TargetFramework Condition="!Exists('$(EngineDir)\Binaries\ThirdParty\DotNet\8.0.300')">net6.0</TargetFramework>
+     
+     <Configuration Condition=" '$(Configuration)' == '' ">Development</Configuration>
+     <OutputType>Library</OutputType>
+@@ -24,7 +22,7 @@
+     <DebugType>pdbonly</DebugType>
+     <Nullable>enable</Nullable>
+   </PropertyGroup>
+-  <PropertyGroup Condition=" $(EngineDir.Contains('UE_5.5')) ">
++  <PropertyGroup>
+     <DefineConstants>$(DefineConstants);UE_5_5_OR_LATER</DefineConstants>
+   </PropertyGroup>
+   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Development|AnyCPU' ">
+@@ -41,7 +39,6 @@
+     <DebugType>full</DebugType>
+   </PropertyGroup>
+   <ItemGroup>
+-    <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
+   </ItemGroup>
+   <ItemGroup>
+     <Reference Include="EpicGames.Build">
+--- a/Source/JsEnv/Private/Gen/FLinearColor_Wrap.cpp
++++ b/Source/JsEnv/Private/Gen/FLinearColor_Wrap.cpp
+@@ -1,84 +1,84 @@
+-/*
+- * Tencent is pleased to support the open source community by making Puerts available.
+- * Copyright (C) 2020 Tencent.  All rights reserved.
+- * Puerts is licensed under the BSD 3-Clause License, except for the third-party components listed in the file 'LICENSE' which may
+- * be subject to their corresponding license terms. This file is subject to the terms and conditions defined in file 'LICENSE',
+- * which is part of this source code package.
+- */
+-
+-// gen by puerts gen tools
+-
+-#include "CoreMinimal.h"
+-#include "UsingTypeDecl.hpp"
+-
+-__DefCDataConverter(FFloat16Color);
+-
+-struct AutoRegisterForFLinearColor
+-{
+-    AutoRegisterForFLinearColor()
+-    {
+-        puerts::DefineClass<FFloat16Color>().Register();
+-
+-        puerts::DefineClass<FLinearColor>()
+-            .Constructor(CombineConstructors(MakeConstructor(FLinearColor), MakeConstructor(FLinearColor, EForceInit),
+-                MakeConstructor(FLinearColor, float, float, float, float), MakeConstructor(FLinearColor, const FColor&),
+-                MakeConstructor(FLinearColor, const FVector&), MakeConstructor(FLinearColor, const FVector4&),
+-                MakeConstructor(FLinearColor, const FFloat16Color&)))
+-            .Property("R", MakeProperty(&FLinearColor::R))
+-            .Property("G", MakeProperty(&FLinearColor::G))
+-            .Property("B", MakeProperty(&FLinearColor::B))
+-            .Property("A", MakeProperty(&FLinearColor::A))
+-            .Method("ToRGBE", MakeFunction(&FLinearColor::ToRGBE))
+-            .Function("FromSRGBColor", MakeFunction(&FLinearColor::FromSRGBColor))
+-            .Function("FromPow22Color", MakeFunction(&FLinearColor::FromPow22Color))
+-            .Method("Component", CombineOverloads(MakeOverload(float& (FLinearColor::*) (int32), &FLinearColor::Component),
+-                                     MakeOverload(const float& (FLinearColor::*) (int32) const, &FLinearColor::Component)))
+-            .Method("op_Addition", MakeFunction(&FLinearColor::operator+))
+-            .Method("op_Subtraction", MakeFunction(&FLinearColor::operator-))
+-            .Method("op_Multiply",
+-                CombineOverloads(MakeOverload(FLinearColor(FLinearColor::*)(const FLinearColor&) const, &FLinearColor::operator*),
+-                    MakeOverload(FLinearColor(FLinearColor::*)(float) const, &FLinearColor::operator*)))
+-            .Method("op_Division",
+-                CombineOverloads(MakeOverload(FLinearColor(FLinearColor::*)(const FLinearColor&) const, &FLinearColor::operator/),
+-                    MakeOverload(FLinearColor(FLinearColor::*)(float) const, &FLinearColor::operator/)))
+-            .Method("GetClamped", MakeFunction(&FLinearColor::GetClamped))
+-            .Method("op_Equality", MakeFunction(&FLinearColor::operator==))
+-            .Method("op_Inequality", MakeFunction(&FLinearColor::operator!=))
+-            .Method("Equals", MakeFunction(&FLinearColor::Equals, SMALL_NUMBER))
+-            .Method("CopyWithNewOpacity", MakeFunction(&FLinearColor::CopyWithNewOpacity))
+-            .Function("MakeRandomColor", MakeFunction(&FLinearColor::MakeRandomColor))
+-            .Function("MakeFromColorTemperature", MakeFunction(&FLinearColor::MakeFromColorTemperature))
+-            .Function("Dist", MakeFunction(&FLinearColor::Dist))
+-            .Method("LinearRGBToHSV", MakeFunction(&FLinearColor::LinearRGBToHSV))
+-            .Method("HSVToLinearRGB", MakeFunction(&FLinearColor::HSVToLinearRGB))
+-            .Function("LerpUsingHSV", MakeFunction(&FLinearColor::LerpUsingHSV))
+-            .Method("Quantize", MakeFunction(&FLinearColor::Quantize))
+-            .Method("QuantizeRound", MakeFunction(&FLinearColor::QuantizeRound))
+-            .Method("ToFColor", MakeFunction(&FLinearColor::ToFColor))
+-            .Method("Desaturate", MakeFunction(&FLinearColor::Desaturate))
+-#if ENGINE_MAJOR_VERSION > 4
+-            .Method("ComputeLuminance", MakeFunction(&FLinearColor::GetLuminance))
+-#else
+-            .Method("ComputeLuminance", MakeFunction(&FLinearColor::ComputeLuminance))
+-#endif
+-            .Method("GetMax", MakeFunction(&FLinearColor::GetMax))
+-            .Method("IsAlmostBlack", MakeFunction(&FLinearColor::IsAlmostBlack))
+-            .Method("GetMin", MakeFunction(&FLinearColor::GetMin))
+-            .Method("GetLuminance", MakeFunction(&FLinearColor::GetLuminance))
+-            .Method("ToString", MakeFunction(&FLinearColor::ToString))
+-            .Method("InitFromString", MakeFunction(&FLinearColor::InitFromString))
+-            //.Variable("Pow22OneOver255Table", MakeVariable(&FLinearColor::Pow22OneOver255Table))
+-            //.Variable("sRGBToLinearTable", MakeVariable(&FLinearColor::sRGBToLinearTable))
+-            .Variable("White", MakeReadonlyVariable(&FLinearColor::White))
+-            .Variable("Gray", MakeReadonlyVariable(&FLinearColor::Gray))
+-            .Variable("Black", MakeReadonlyVariable(&FLinearColor::Black))
+-            .Variable("Transparent", MakeReadonlyVariable(&FLinearColor::Transparent))
+-            .Variable("Red", MakeReadonlyVariable(&FLinearColor::Red))
+-            .Variable("Green", MakeReadonlyVariable(&FLinearColor::Green))
+-            .Variable("Blue", MakeReadonlyVariable(&FLinearColor::Blue))
+-            .Variable("Yellow", MakeReadonlyVariable(&FLinearColor::Yellow))
+-            .Register();
+-    }
+-};
+-
+-AutoRegisterForFLinearColor _AutoRegisterForFLinearColor_;
++/*
++ * Tencent is pleased to support the open source community by making Puerts available.
++ * Copyright (C) 2020 Tencent.  All rights reserved.
++ * Puerts is licensed under the BSD 3-Clause License, except for the third-party components listed in the file 'LICENSE' which may
++ * be subject to their corresponding license terms. This file is subject to the terms and conditions defined in file 'LICENSE',
++ * which is part of this source code package.
++ */
++
++// gen by puerts gen tools
++
++#include "CoreMinimal.h"
++#include "UsingTypeDecl.hpp"
++
++__DefCDataConverter(FFloat16Color);
++
++struct AutoRegisterForFLinearColor
++{
++    AutoRegisterForFLinearColor()
++    {
++        puerts::DefineClass<FFloat16Color>().Register();
++
++        puerts::DefineClass<FLinearColor>()
++            .Constructor(CombineConstructors(MakeConstructor(FLinearColor), MakeConstructor(FLinearColor, EForceInit),
++                MakeConstructor(FLinearColor, float, float, float, float), MakeConstructor(FLinearColor, const FColor&),
++                MakeConstructor(FLinearColor, const FVector&), MakeConstructor(FLinearColor, const FVector4&),
++                MakeConstructor(FLinearColor, const FFloat16Color&)))
++            .Property("R", MakeProperty(&FLinearColor::R))
++            .Property("G", MakeProperty(&FLinearColor::G))
++            .Property("B", MakeProperty(&FLinearColor::B))
++            .Property("A", MakeProperty(&FLinearColor::A))
++            .Method("ToRGBE", MakeFunction(&FLinearColor::ToRGBE))
++            .Function("FromSRGBColor", MakeFunction(&FLinearColor::FromSRGBColor))
++            .Function("FromPow22Color", MakeFunction(&FLinearColor::FromPow22Color))
++            .Method("Component", CombineOverloads(MakeOverload(float& (FLinearColor::*) (int32), &FLinearColor::Component),
++                                     MakeOverload(const float& (FLinearColor::*) (int32) const, &FLinearColor::Component)))
++            .Method("op_Addition", MakeFunction(&FLinearColor::operator+))
++            .Method("op_Subtraction", MakeFunction(&FLinearColor::operator-))
++            .Method("op_Multiply",
++                CombineOverloads(MakeOverload(FLinearColor(FLinearColor::*)(const FLinearColor&) const, &FLinearColor::operator*),
++                    MakeOverload(FLinearColor(FLinearColor::*)(float) const, &FLinearColor::operator*)))
++            .Method("op_Division",
++                CombineOverloads(MakeOverload(FLinearColor(FLinearColor::*)(const FLinearColor&) const, &FLinearColor::operator/),
++                    MakeOverload(FLinearColor(FLinearColor::*)(float) const, &FLinearColor::operator/)))
++            .Method("GetClamped", MakeFunction(&FLinearColor::GetClamped))
++            .Method("op_Equality", MakeFunction(&FLinearColor::operator==))
++            .Method("op_Inequality", MakeFunction(&FLinearColor::operator!=))
++            .Method("Equals", MakeFunction(&FLinearColor::Equals, SMALL_NUMBER))
++            .Method("CopyWithNewOpacity", MakeFunction(&FLinearColor::CopyWithNewOpacity))
++            .Function("MakeRandomColor", MakeFunction(&FLinearColor::MakeRandomColor))
++            .Function("MakeFromColorTemperature", MakeFunction(&FLinearColor::MakeFromColorTemperature))
++            .Function("Dist", MakeFunction(&FLinearColor::Dist))
++            .Method("LinearRGBToHSV", MakeFunction(&FLinearColor::LinearRGBToHSV))
++            .Method("HSVToLinearRGB", MakeFunction(&FLinearColor::HSVToLinearRGB))
++            .Function("LerpUsingHSV", MakeFunction(&FLinearColor::LerpUsingHSV))
++            .Method("Quantize", MakeFunction(&FLinearColor::QuantizeFloor))
++            .Method("QuantizeRound", MakeFunction(&FLinearColor::QuantizeRound))
++            .Method("ToFColor", MakeFunction(&FLinearColor::ToFColor))
++            .Method("Desaturate", MakeFunction(&FLinearColor::Desaturate))
++#if ENGINE_MAJOR_VERSION > 4
++            .Method("ComputeLuminance", MakeFunction(&FLinearColor::GetLuminance))
++#else
++            .Method("ComputeLuminance", MakeFunction(&FLinearColor::ComputeLuminance))
++#endif
++            .Method("GetMax", MakeFunction(&FLinearColor::GetMax))
++            .Method("IsAlmostBlack", MakeFunction(&FLinearColor::IsAlmostBlack))
++            .Method("GetMin", MakeFunction(&FLinearColor::GetMin))
++            .Method("GetLuminance", MakeFunction(&FLinearColor::GetLuminance))
++            .Method("ToString", MakeFunction(&FLinearColor::ToString))
++            .Method("InitFromString", MakeFunction(&FLinearColor::InitFromString))
++            //.Variable("Pow22OneOver255Table", MakeVariable(&FLinearColor::Pow22OneOver255Table))
++            //.Variable("sRGBToLinearTable", MakeVariable(&FLinearColor::sRGBToLinearTable))
++            .Variable("White", MakeReadonlyVariable(&FLinearColor::White))
++            .Variable("Gray", MakeReadonlyVariable(&FLinearColor::Gray))
++            .Variable("Black", MakeReadonlyVariable(&FLinearColor::Black))
++            .Variable("Transparent", MakeReadonlyVariable(&FLinearColor::Transparent))
++            .Variable("Red", MakeReadonlyVariable(&FLinearColor::Red))
++            .Variable("Green", MakeReadonlyVariable(&FLinearColor::Green))
++            .Variable("Blue", MakeReadonlyVariable(&FLinearColor::Blue))
++            .Variable("Yellow", MakeReadonlyVariable(&FLinearColor::Yellow))
++            .Register();
++    }
++};
++
++AutoRegisterForFLinearColor _AutoRegisterForFLinearColor_;
+--- a/Source/JsEnv/Private/JSGeneratedClass.cpp
++++ b/Source/JsEnv/Private/JSGeneratedClass.cpp
+@@ -276,8 +276,9 @@
+ #endif
+ 
+ #if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION > 2
+-    UField** PP = nullptr;
+-    UField* ChildrenPtr = Class->Children.Get();
++    using FFieldLink = decltype(UField::Next);
++    FFieldLink* PP = nullptr;
++    FFieldLink ChildrenPtr = Class->Children;
+     PP = &ChildrenPtr;
+ #else
+     auto PP = &Class->Children;
+--- a/Source/JsEnv/Private/JsEnvImpl.cpp
++++ b/Source/JsEnv/Private/JsEnvImpl.cpp
+@@ -2393,7 +2393,7 @@
+     {
+         JsCallbackPrototypeMap[SignatureFunction]->Call(Isolate, Context, Info,
+             [MulticastScriptDelegate = static_cast<FMulticastScriptDelegate*>(DelegatePtr)](void* Params)
+-            { MulticastScriptDelegate->ProcessMulticastDelegate<UObject>(Params); });
++            { MulticastScriptDelegate->ProcessDelegate<UObject>(Params); });
+     }
+ }
+ 

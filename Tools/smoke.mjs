@@ -6,6 +6,7 @@
 //     waitFor('Button text' | 'css selector')  (holds the script until it appears, up to 30 s)
 import fs from 'node:fs';
 import {shaderAssetName} from './cook-shaders.mjs';
+import {installSmokeNet, installSmokePlatform} from './smoke-net.mjs';
 import {Buffer} from 'node:buffer';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
@@ -28,7 +29,7 @@ export async function smoke(game, {frames = 600, script, search = '', verbose = 
   const t0 = performance.now(), nativeNow = performance.now.bind(performance), nodeTimeout = setTimeout;
   const print = console.log.bind(console);
   const stats = {files: 0, missing: new Set(), geometries: 0, geometryMB: 0, materials: 0, textures: 0, frames: 0, records: {}, lastFloats: 0,
-    errors: 0, warns: 0, uiPublishes: 0, uiBytes: 0, voices: 0, voiceFiles: new Set(), pcmVoices: 0, events: 0, unsupported: new Set()};
+    errors: 0, warns: 0, uiPublishes: 0, uiBytes: 0, voices: 0, voiceFiles: new Set(), pcmVoices: 0, events: 0, unsupported: new Set(), opened: [], address: null};
   const logs = [], seen = new Set(), storage = new Map(), shaderBodies = new Map(), nativeCoverage = {};
   const shaderStore = path.join(game.out, 'jsgb-store');
   const storeFile = k => 'shader-' + createHash('md5').update(Buffer.from(k, 'latin1')).digest('hex') + '.json';
@@ -37,6 +38,11 @@ export async function smoke(game, {frames = 600, script, search = '', verbose = 
   const host = {
     shaderPreparation: prepareShaders,
     search,
+    // The page's address as the Unreal host gives it (JsgbAddress.cpp): the game's origin, and URLs the page opens in
+    // the system browser are recorded instead of opened.
+    origin: publication.origin || undefined,
+    setAddress(address) { stats.address = address; },
+    openExternal(url) { stats.opened.push(url); print('opened in the system browser: ' + url.slice(0, 160)); return true; },
     now: () => nativeNow() - t0,
     trace: process.env.JSGB_TRACE === '1',
     readFile(p) {
@@ -89,8 +95,12 @@ export async function smoke(game, {frames = 600, script, search = '', verbose = 
       pcm() { stats.pcmVoices++; },
     },
   };
+  installSmokeNet(host, stats);
+  installSmokePlatform(host);
   let lastFrame = null;
-  for (const k of ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'structuredClone', 'Blob', 'fetch', 'Response', 'Headers', 'Request',
+  // Node 23+ also defines ErrorEvent, CloseEvent and EventSource through its internal fetch (undici), loaded lazily on
+  // first read. Removed with the rest, so the runtime's versions are used and undici never loads without Buffer.
+  for (const k of ['ErrorEvent', 'CloseEvent', 'EventSource', 'WebSocketStream', 'URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'structuredClone', 'Blob', 'fetch', 'Response', 'Headers', 'Request',
     'AbortController', 'AbortSignal', 'navigator', 'performance', 'atob', 'btoa', 'Event', 'EventTarget', 'CustomEvent', 'MessageEvent', 'DOMException',
     'BroadcastChannel', 'MessageChannel', 'MessagePort', 'WebSocket', 'File', 'FormData', 'CompressionStream', 'DecompressionStream', 'ReadableStream',
     'WritableStream', 'TransformStream', 'crypto', 'Navigator', 'Performance', 'localStorage', 'sessionStorage', 'Storage'])

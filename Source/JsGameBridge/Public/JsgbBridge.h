@@ -35,9 +35,14 @@ public:
 	UPROPERTY() FJsgbViewportDelegate OnViewport;
 	UPROPERTY() FJsgbStringDelegate OnGamepads;
 	UPROPERTY() FJsgbEvalDelegate OnEval;
+	/** Restarts the page at a path and query on its origin (a sign-in coming back from the system browser). */
+	UPROPERTY() FJsgbStringDelegate OnNavigate;
 
 	/** location.search the game boots with (e.g. "?play"). */
 	UPROPERTY() FString Search;
+	/** The page's origin ("http://localhost:5180") and location.pathname (PagePath) at this start (JsgbAddress.cpp). */
+	UPROPERTY() FString Origin;
+	UPROPERTY() FString PagePath = TEXT("/");
 	/** -JsgbTraceMirror: the runtime logs each object's type, name and uuid the first time it is drawn. */
 	UPROPERTY() bool Trace = false;
 	/** The merged asset registry JSON the build wrote. */
@@ -46,8 +51,31 @@ public:
 	UPROPERTY() int32 Seed = 0;
 	/** Absolute path of the bundle (.mjs). */
 	UPROPERTY() FString BundlePath;
+	/** navigator.platform for the game: "MacIntel" on a Mac, so it picks ⌘ shortcuts as in a Mac browser. */
+	UPROPERTY() FString Platform = PLATFORM_MAC ? TEXT("MacIntel") : PLATFORM_LINUX ? TEXT("Linux x86_64") : TEXT("Win32");
 
 	// Platform services.
+	/** Secure random bytes for crypto.getRandomValues, and network requests for fetch() to the origins the game may
+	 *  reach (JsgbNet.cpp, Runtime/src/netFetch.ts). HttpStart returns 0 for a refused URL; HttpTake is empty until the
+	 *  reply is in. */
+	UFUNCTION() FArrayBufferValue RandomBytes(int32 Count);
+	UFUNCTION() int32 HttpStart(const FString& Method, const FString& Url, const FString& HeadersJson, FArrayBuffer Body);
+	UFUNCTION() FArrayBufferValue HttpTake(int32 Id);
+	/** Streamed requests for the page's fetch (JsgbNetStream.cpp, Runtime/src/fetchStream.ts): HttpStream starts one (0 for
+	 *  a refused URL), HttpRead is empty until something new has arrived, HttpCancel ends it. */
+	UFUNCTION() int32 HttpStream(const FString& Method, const FString& Url, const FString& HeadersJson, FArrayBuffer Body);
+	UFUNCTION() FArrayBufferValue HttpRead(int32 Id);
+	UFUNCTION() void HttpCancel(int32 Id);
+	/** The origins fetch() may reach, for the page and its workers: the game's netAllow (publication.json beside
+	 *  BundlePath) and -JsgbNetAllow=. */
+	void ConfigureNet();
+	/** Origin, PagePath and Search for this start: publication.json "origin" or -JsgbOrigin=, and the address the page had
+	 *  when it last restarted (SetAddress). */
+	void ConfigureAddress();
+	/** The path and query the page starts at next time, and an http(s) URL for the system browser (JsgbAddress.cpp). */
+	UFUNCTION() void SetAddress(const FString& PathAndQuery);
+	UFUNCTION() bool OpenExternal(const FString& Url);
+
 	UFUNCTION() FArrayBufferValue ReadFile(const FString& Path);
 	/** The display (window.jsgb.display): the monitor's resolutions as JSON [{width, height, refresh}], the current settings
 	 *  as JSON {width, height, mode, vsync, maxFps}, and a change ({width?, height?, mode?, vsync?, maxFps?}) applied on
@@ -62,6 +90,10 @@ public:
 	FString DisplayFile;
 	/** The game's display.json (or a display set since) has a frame cap the player chose, unlimited (0) included. */
 	bool bSavedFrameCap = false;
+	/** window.jsgb.setFrameRate: the most frames a second the page asks Unreal to present, 0 for no request. Any thread
+	 *  sets it; AJsgbHost::Tick applies it (JsgbFrameCap.h, JsgbFrameCap.cpp). */
+	UFUNCTION() void SetFrameRate(float Fps);
+	std::atomic<float> AskedFrameRate{0.f};
 	/** Applies a display change ({width?, height?, mode?, vsync?, maxFps?}) without saving Unreal's settings. Game thread. */
 	static void ApplyDisplay(const TSharedPtr<class FJsonObject>& In);
 	/** At launch: clears any frame cap left in Unreal's shared settings, then applies this game's saved display settings. */
@@ -87,7 +119,45 @@ public:
 	/** readRenderTargetPixelsAsync: ask for a capture target's pixels, then poll until they come (JsgbSceneMirror). */
 	UFUNCTION() void CaptureRead(int32 TextureId);
 	UFUNCTION() FArrayBufferValue CaptureTake(int32 TextureId);
+	/** Files the person picks in the open panel or drops on the window, read by id (JsgbFiles.cpp, Runtime/src/fileApi.ts).
+	 *  FilePickOpen returns a request (0: no panel here); FilePickTake is empty while the panel is up, then {"files": [...]} or
+	 *  {"cancel": true}. PickedFolderList is a chosen folder's entries, DroppedFiles the latest drop's files (once). */
+	UFUNCTION() int32 FilePickOpen(const FString& OptionsJson);
+	UFUNCTION() FString FilePickTake(int32 Request);
+	UFUNCTION() FArrayBufferValue PickedFileRead(int32 Id, double Offset, int32 Length);
+	UFUNCTION() FString PickedFolderList(int32 Id);
+	UFUNCTION() FString DroppedFiles();
+	/** Exports (Runtime/src/media.ts): a picture of a scene frame drawn now (JsgbCapture.cpp), image files, the save
+	 *  dialog, downloads and H.264 video (JsgbMedia.cpp, JsgbSavePanelMac.mm, JsgbVideoEncodeMac.mm). */
+	UFUNCTION() FArrayBufferValue CaptureView(FArrayBuffer Floats, int32 Count, FArrayBuffer Instances, int32 InstanceFloats, int32 Width, int32 Height, bool bFloat);
+	/** A page's full-screen passes into render targets, run when it reads one back (JsgbPassRunner.cpp): a scene they
+	 *  start from into a slot, then the passes in order, returning the rectangle read as floats. */
+	UFUNCTION() bool PassScene(FArrayBuffer Floats, int32 Count, FArrayBuffer Instances, int32 InstanceFloats, int32 Slot, int32 Width, int32 Height, int32 Format);
+	UFUNCTION() FArrayBufferValue PassRun(const FString& Json);
+	UFUNCTION() FArrayBufferValue EncodeImage(FArrayBuffer Rgba, int32 Width, int32 Height, const FString& Type, float Quality);
+	UFUNCTION() int32 SavePick(const FString& Name, const FString& TypesJson);
+	UFUNCTION() FString SaveTake(int32 Id);
+	UFUNCTION() bool SaveWrite(int32 Id, FArrayBuffer Bytes, bool bAppend);
+	UFUNCTION() FString Download(const FString& Name, FArrayBuffer Bytes);
+	UFUNCTION() bool VideoSupported(const FString& Json);
+	UFUNCTION() int32 VideoOpen(const FString& Json);
+	UFUNCTION() bool VideoEncode(int32 Id, FArrayBuffer Rgba, int32 Width, int32 Height, double TimestampUs, double DurationUs, bool bKey);
+	UFUNCTION() FArrayBufferValue VideoTake(int32 Id);
+	UFUNCTION() bool VideoFlush(int32 Id);
+	UFUNCTION() void VideoClose(int32 Id);
 	UFUNCTION() void BlobRevoke(const FString& Url);
+	/** What a browser takes from the system (JsgbSystem.h): window.alert, confirm and prompt as a native dialog the call
+	 *  waits for ("1" and the typed text for OK, "0" for Cancel), the clipboard (types as JSON, text by web type, the
+	 *  picture as PNG, copied files as entries, and a write of {type: text} with an optional PNG), the light or dark
+	 *  look ("dark", "light", or empty) and the time zone's IANA name. */
+	UFUNCTION() FString ShowDialog(const FString& Kind, const FString& Message, const FString& Value);
+	UFUNCTION() FString ClipboardTypes();
+	UFUNCTION() FString ClipboardText(const FString& Type);
+	UFUNCTION() FArrayBufferValue ClipboardImage();
+	UFUNCTION() FString ClipboardFiles();
+	UFUNCTION() bool ClipboardWrite(const FString& TextsJson, FArrayBuffer Png);
+	UFUNCTION() FString ColorScheme();
+	UFUNCTION() FString TimeZoneName();
 	/** V8's sampling profiler on the calling thread's isolate: "start", or "stop <file>" to write a .cpuprofile
 	 *  (Chrome DevTools' Performance panel opens it). Called from the game's JavaScript, for example through /bridge/eval. */
 	UFUNCTION() FString ProfileJs(const FString& Command);
@@ -111,7 +181,9 @@ public:
 	UFUNCTION() void Log(const FString& Level, const FString& Text);
 	UFUNCTION() void RequestReload();
 	UFUNCTION() FString LoadStore(const FString& Key);
-	UFUNCTION() void SaveStore(const FString& Key, const FString& Data);
+	UFUNCTION() bool SaveStore(const FString& Key, const FString& Data);
+	/** Deletes a stored entry's file (IndexedDB removes what it no longer needs instead of leaving empty files). */
+	UFUNCTION() void RemoveStore(const FString& Key);
 	UFUNCTION() void JsReady(const FString& Info);
 	/** Bytes kept for the life of the Unreal process, so a hot reload can reuse earlier work (worker results). */
 	UFUNCTION() FArrayBufferValue CacheGet(const FString& Key);

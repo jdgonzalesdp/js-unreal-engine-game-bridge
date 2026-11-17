@@ -9,6 +9,15 @@ import {materialRules, materialHits, ruleTextures, type MaterialHit} from './mat
 import {skeletalRules, skeletalGroup, jointData, skeletonInfo, hideMask, type SkeletalAsset} from './skeletal';
 import {graphicsState} from './graphics';
 import {beginEffects, noteEffect, effectLights, effectSystems} from './lumenEffects';
+import {noteShader, shaderDrawable} from './shaderGuard';
+import {textStandIn} from './troikaText';
+import {deformedCopy} from './skinning';
+import {exportPostPasses} from './postPasses';
+import {hookProgramKey} from './hookKey';
+import {firstChange, materialInputs, quickExtras, rememberInputs, sameInputs} from './materialInputs';
+import {fatLineGeometry} from './fatLines';
+import {splatStandIns} from './splatStandIn';
+import {backdropMatrix, drawsThrough, flushDrawOrders, noteDrawOrder, setDrawEye} from './drawOrder';
 
 /** Mirrors the game's Three.js scene into Unreal each frame. Geometry, materials and textures are
  *  sent once and again only when their version changes; transforms, instances, lights and the
@@ -80,6 +89,11 @@ const materialSig = new Map<number, string>();
 const textureSig = new Map<number, number>();
 const sentShaders = new Set<string>();
 const instanceVersion = new WeakMap<object, string>();
+// The export each instanced mesh was last sent in. Unreal destroys an object unseen for 600 frames (JsgbSceneMirror.cpp),
+// instances and all, so one that comes back after a long absence (splats while PrepViz's plan view hides them) sends
+// its instances again.
+const instanceSeen = new WeakMap<object, number>();
+const INSTANCES_KEPT = 300;
 /** What the recorder has sent the host so far: new ids it had to create and descriptions it re-sent. */
 export const exportStats = {materialsNew: 0, materialSends: 0, texturesNew: 0, textureSends: 0, geometriesNew: 0, geometrySends: 0, get nextId() { return nextId; }};
 
@@ -381,8 +395,8 @@ function hookShader(mat: THREE.Material): {key: string; shader: HookedShader; ad
   // three's own customProgramCacheKey is the hook's source text (Function.toString), which is slow to build every
   // frame; with that default, the same version and hook function mean the same key.
   if (cached && cached.version === mat.version && cached.hook === mat.onBeforeCompile && mat.customProgramCacheKey === defaultCacheKey) return cached;
-  let key = '';
-  try { key = `${mat.version}|${mat.customProgramCacheKey?.() ?? ''}`; } catch { key = String(mat.version); }
+  // As in WebGLRenderer.getProgram, the hook runs again only for a new program key, not for needsUpdate alone (hookKey.ts).
+  const key = hookProgramKey(mat, cached);
   if (cached && cached.key === key) { cached.version = mat.version; cached.hook = mat.onBeforeCompile; return cached; }
   const lib = (THREE.ShaderLib as Record<string, {vertexShader: string; fragmentShader: string; uniforms: Record<string, {value: unknown}>}>)[SHADER_LIB[mat.type] ?? 'standard'];
   const shader = {uniforms: lib ? THREE.UniformsUtils.clone(lib.uniforms) : {}, vertexShader: lib?.vertexShader ?? '', fragmentShader: lib?.fragmentShader ?? '', defines: {}, shaderName: mat.type};
@@ -514,7 +528,8 @@ function quickValues(m: THREE.MeshStandardMaterial & THREE.MeshPhysicalMaterial 
   i = putTexture(s, i, m.metalnessMap); i = putTexture(s, i, m.aoMap); i = putTexture(s, i, m.alphaMap);
   s[i++] = +!!m.flatShading; s[i++] = +m.toneMapped; s[i++] = +(m.fog !== false); s[i++] = m.envMapIntensity ?? -1; s[i++] = +!!m.alphaHash;
   s[i++] = pointSize(m); s[i++] = +!!m.sizeAttenuation; s[i++] = m.linewidth ?? -1; s[i++] = m.clearcoat ?? -1; s[i++] = m.transmission ?? -1; s[i++] = m.ior ?? -1;
-  return i;
+  s[i++] = m.depthFunc; // drawOrder.ts: AlwaysDepth draws through
+  return quickExtras(m as never, s, i);
 }
 
 // A point's size in screen pixels (sizeAttenuation off): three draws it in the pixels of the view's target.
@@ -564,12 +579,14 @@ function syncMaterial(mat: THREE.Material, hit: MaterialHit | null = null): numb
   else if (hookEntry) count = quickHooked(mat, hookEntry, count);
   // The uniforms to describe, filled in from the material only past this point (see quickHooked).
   const extra = () => shader ? m.uniforms as Record<string, {value: unknown}> : hookUniforms(mat);
+  const inputsNow = () => materialInputs(mat, hookEntry, drawsLinear(), instancedUse.get(mat));
   let uniformsOnly = false;
   if (count >= 0) {
     const last = quick.get(mat), key = hit ? 'rule:' + hit.rule.name : mat.userData?.materialKey ?? mat.userData?.assetMaterialKey;
     if (last && last.values.length === count && last.name === mat.name && last.key === key) {
-      let first = -1;
-      for (let i = 0; i < count; i++) if (last.values[i] !== scratch[i] && !(last.values[i] !== last.values[i] && scratch[i] !== scratch[i])) { first = i; break; }
+      let first = firstChange(last.values, scratch, count);
+      // needsUpdate alone, with nothing it could stand for changed (materialInputs.ts): the version is not a change.
+      if (first === 0 && sameInputs(mat, inputsNow())) { last.values[0] = scratch[0]; first = firstChange(last.values, scratch, count, 1); }
       if (first < 0) return id;
       // Only uniform values moved (a time or colour uniform animating): the rest of the description is reused.
       uniformsOnly = first >= base && last.base === base && materialRest.has(mat) && drawsLinear() === materialRest.get(mat)!.linear;
@@ -601,6 +618,7 @@ function syncMaterial(mat: THREE.Material, hit: MaterialHit | null = null): numb
   const hooked = shader ? undefined : hookShader(mat);
   if ((shader || hooked) && !registryMaterial) {
     let t = shader ? translateShaderMaterial(m, instancedUse.get(mat)) : translateHookedMaterial(mat, hooked!.shader, hooked!.key, instancedUse.get(mat));
+    noteShader(mat, t);
     // A ShaderMaterial's gl_FragColor drawn to the screen is already in display (sRGB) values, and Unreal decodes it
     // to linear light so its own output encoding gives the same pixel. Drawn into a post-processing render target
     // (EffectComposer), it's linear light, and the final pass encodes it with the rest of the scene.
@@ -623,6 +641,7 @@ function syncMaterial(mat: THREE.Material, hit: MaterialHit | null = null): numb
     opacity: mat.opacity, transparent: mat.transparent || drawFirst(mat) || alphaBlended(mat), drawFirst: drawFirst(mat) || undefined, alphaTest: mat.alphaTest, side: mat.side,
     vertexColors: !!mat.vertexColors, unlit: shader || ['MeshBasicMaterial', 'SpriteMaterial', 'PointsMaterial', 'LineBasicMaterial', 'LineDashedMaterial'].includes(mat.type),
     blending: mat.blending, depthWrite: mat.depthWrite, depthTest: mat.depthTest, colorWrite: mat.colorWrite, wireframe: !!m.wireframe,
+    drawThrough: drawsThrough(mat) || undefined, // drawOrder.ts: drawn without the depth test
     // A material rule's Unreal material gets only the textures the rule names, so the game's own maps aren't uploaded.
     ...(hit ? {map: 0} : {map: shader ? uniformTexture(m) : textureId(m.map), emissiveMap: textureId(m.emissiveMap), normalMap: textureId(m.normalMap), roughnessMap: textureId(m.roughnessMap),
       metalnessMap: textureId(m.metalnessMap), aoMap: textureId(m.aoMap), alphaMap: textureId(m.alphaMap)}),
@@ -645,6 +664,7 @@ function syncMaterial(mat: THREE.Material, hit: MaterialHit | null = null): numb
     const {color: _c, map: _m, uniforms: _u, ...others} = desc;
     materialRest.set(mat, {json: ',' + JSON.stringify(others).slice(1), linear: drawsLinear()});
   } else materialRest.delete(mat);
+  rememberInputs(mat, inputsNow());
   if (materialSig.get(id) !== sig) { exportStats.materialSends++; if (!materialSig.has(id)) exportStats.materialsNew++; materialSig.set(id, sig); sink()?.material(id, sig); }
   return id;
 }
@@ -669,7 +689,8 @@ function emitInstances(im: THREE.InstancedMesh, gid: number, mat: number, fit: T
   const extras = gid >= 0 ? instanceExtras(im.geometry) : [];
   const extraFloats = extras.reduce((n, e) => n + e.size, 0);
   const version = `${im.instanceMatrix.version}|${count}|${im.instanceColor?.version ?? -1}|${gid}|${extras.map(e => e.attr.version).join(',')}`;
-  const changed = instanceVersion.get(im) !== version;
+  const seen = instanceSeen.get(im); instanceSeen.set(im, exportCount);
+  const changed = instanceVersion.get(im) !== version || seen === undefined || exportCount - seen > INSTANCES_KEPT;
   push(INSTANCED); push(idOf(im)); push(gid); push(mat); push(flagsOf(im)); push(count); pushMatrix(im.matrixWorld);
   // Bit 0: instance colours follow the matrices; the rest: the number of per-instance extra floats after them.
   push(changed ? 1 : 0); push(changed ? (im.instanceColor ? 1 : 0) + extraFloats * 2 : 0);
@@ -763,6 +784,8 @@ type Deformed = {geometry: THREE.BufferGeometry; source: THREE.BufferGeometry; s
 const deformedOf = new WeakMap<THREE.Mesh, Deformed>();
 const deformVector = new THREE.Vector3(), deformNormal = new THREE.Vector3(), deformTemp = new THREE.Vector3(), deformNormalBase = new THREE.Vector3();
 function deformedGeometry(o: THREE.Mesh): THREE.BufferGeometry {
+  // Skinned and morphed meshes: Runtime/src/skinning.ts (the code below is kept for any mesh it passes on).
+  const copy = deformedCopy(o); if (copy) return copy;
   const skinned = (o as THREE.SkinnedMesh).isSkinnedMesh && !!(o as THREE.SkinnedMesh).skeleton;
   const morphed = !!o.morphTargetInfluences?.length && !!o.geometry.morphAttributes.position?.length;
   if (!skinned && !morphed) return o.geometry;
@@ -844,12 +867,13 @@ function emitMesh(o: THREE.Mesh) {
   const gid = syncGeometry(geo);
   if (fresh) newGeometryMs += host.now() - t0;
   if (!gid) return;
-  if ((o as THREE.InstancedMesh).isInstancedMesh) { emitInstances(o as THREE.InstancedMesh, gid, syncMaterial(noteInstanced(mats[0], o as THREE.InstancedMesh)!)); return; }
+  if ((o as THREE.InstancedMesh).isInstancedMesh) { noteDrawOrder(idOf(o), o); emitInstances(o as THREE.InstancedMesh, gid, syncMaterial(noteInstanced(mats[0], o as THREE.InstancedMesh)!)); return; }
   const hits = materialHits(o, materialRules(host.registry), t => host.log('log', t));
   if (hits && hits.every(h => h?.rule.hide)) return;
   push(MESH); push(idOf(o)); push(gid); push(flagsOf(o)); push(mats.length);
   for (let i = 0; i < mats.length; i++) push(mats[i] ? syncMaterial(mats[i], hits?.[i] ?? null) : 0);
-  pushMatrix(o.matrixWorld);
+  noteDrawOrder(idOf(o), o); // drawOrder.ts: three's sort order, and a backdrop pushed behind the scene
+  pushMatrix(backdropMatrix(o, mats[0]));
 }
 
 /** Skeletal swap (Runtime/src/skeletal.ts): record SKELETAL, drawn by the group's first visible primitive.
@@ -966,8 +990,18 @@ function emitGeometryInstances(o: THREE.Mesh, src: THREE.InstancedBufferGeometry
   im.count = count; im.material = mat; im.name = o.name; im.frustumCulled = false;
   im.castShadow = o.castShadow; im.receiveShadow = o.receiveShadow; im.userData = o.userData;
   im.matrixWorld.copy(o.matrixWorld);
+  noteDrawOrder(idOf(im), o);
   const gid = syncGeometry(e.geo); if (!gid) return;
-  emitInstances(im, gid, syncMaterial(noteInstanced(mat, im)!));
+  const mid = syncMaterial(noteInstanced(mat, im)!);
+  // Its copies are placed by the shader: until that is translated, the generic material would stack them all at the origin.
+  if (shaderDrawable(mat, 'instanced geometry')) emitInstances(im, gid, mid);
+}
+
+/** A splat stand-in (splatStandIn.ts): hidden until its shader is translated, as the generic material can't place it. */
+function emitSplats(im: THREE.InstancedMesh) {
+  const gid = syncGeometry(im.geometry); if (!gid) return;
+  const mat = im.material as THREE.Material, mid = syncMaterial(noteInstanced(mat, im)!);
+  if (shaderDrawable(mat, 'Gaussian splats')) emitInstances(im, gid, mid);
 }
 
 function emitPrimitive(o: THREE.Points | THREE.Line, kind: number, primitive: number) {
@@ -985,44 +1019,21 @@ function emitPrimitive(o: THREE.Points | THREE.Line, kind: number, primitive: nu
 }
 
 // Line2 and LineSegments2 (three's fat lines) are meshes of one quad per segment, placed by instanceStart and
-// instanceEnd. Unreal draws them as ordinary segments with the LineMaterial's width.
-const fatGeometry = new WeakMap<THREE.BufferGeometry, {sig: string; geometry: THREE.BufferGeometry}>();
+// instanceEnd. Unreal draws them as ordinary segments with the LineMaterial's width, from a stand-in kept per line
+// (fatLines.ts).
 const fatMaterial = new WeakMap<THREE.Material, THREE.LineBasicMaterial>();
 function emitFatLine(o: THREE.Mesh) {
-  const src = o.geometry, lm = o.material as THREE.Material & Record<string, any>;
-  const a = src?.attributes as unknown as Record<string, THREE.InterleavedBufferAttribute | undefined>;
-  const start = a?.instanceStart, end = a?.instanceEnd;
-  if (!start || !end || !lm?.visible) return;
-  const cs = a.instanceColorStart, ce = a.instanceColorEnd, ds = a.instanceDistanceStart, de = a.instanceDistanceEnd;
-  const instanced = (src as THREE.InstancedBufferGeometry).instanceCount;
-  const count = Math.min(start.count, Number.isFinite(instanced) ? instanced : start.count);
-  const sig = [start.data.version, cs?.data.version ?? -1, count, lm.dashed ? [ds?.data.version, lm.dashSize, lm.gapSize, lm.dashScale].join(',') : ''].join('|');
-  let cached = fatGeometry.get(src);
-  if (!cached || cached.sig !== sig) {
-    const pos: number[] = [], col: number[] = [];
-    for (let i = 0; i < count; i++) {
-      pos.push(start.getX(i), start.getY(i), start.getZ(i), end.getX(i), end.getY(i), end.getZ(i));
-      if (cs && ce) col.push(cs.getX(i), cs.getY(i), cs.getZ(i), ce.getX(i), ce.getY(i), ce.getZ(i));
-    }
-    let g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    if (col.length) g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
-    if (lm.dashed && ds && de) {
-      const dist: number[] = [];
-      for (let i = 0; i < count; i++) dist.push(ds.getX(i), de.getX(i));
-      g.setAttribute('lineDistance', new THREE.Float32BufferAttribute(dist, 1));
-      g = dashedGeometry(g, 2, g.attributes.lineDistance as THREE.BufferAttribute, lm.dashSize ?? 1, lm.gapSize ?? 1, lm.dashScale ?? 1) ?? g;
-    }
-    cached = {sig, geometry: g};
-    fatGeometry.set(src, cached);
-  }
+  const lm = o.material as THREE.Material & Record<string, any>;
+  if (!lm?.visible) return;
+  const geometry = fatLineGeometry(o, lm); if (!geometry) return;
+  const cs = (o.geometry.attributes as Record<string, unknown>).instanceColorStart;
   let m = fatMaterial.get(lm);
   if (!m) { m = new THREE.LineBasicMaterial(); fatMaterial.set(lm, m); }
   if (lm.color) m.color.copy(lm.color);
   m.opacity = lm.opacity; m.transparent = lm.transparent; m.vertexColors = !!lm.vertexColors && !!cs;
   m.depthTest = lm.depthTest; m.depthWrite = lm.depthWrite; m.blending = lm.blending; m.toneMapped = lm.toneMapped;
   m.userData.jsgbFatWidth = lm.linewidth ?? 1; m.userData.jsgbFatWorld = !!lm.worldUnits;
-  const gid = syncGeometry(cached.geometry, 2); if (!gid) return;
+  const gid = syncGeometry(geometry, 2); if (!gid) return;
   push(LINES); push(idOf(o)); push(gid); push(syncMaterial(m)); push(flagsOf(o)); pushMatrix(o.matrixWorld);
 }
 
@@ -1131,6 +1142,9 @@ function walk(o: THREE.Object3D, cam: THREE.Camera, skipKey: string | null) {
 function walkObject(o: THREE.Object3D, cam: THREE.Camera, skipKey: string | null) {
   if (!o.visible) return;
   if ((o as THREE.LOD).isLOD && (o as THREE.LOD).autoUpdate) (o as THREE.LOD).update(cam);
+  // A Spark renderer (Gaussian splats) is drawn as its splats' instanced stand-ins and never run (splatStandIn.ts).
+  const splats = splatStandIns(o);
+  if (splats) { if (visibleTo(o, cam)) for (const im of splats) emitSplats(im); return; }
   // Geometry that an imported Unreal asset replaces is tagged with assetContent; runtime
   // attachments under the same root (mounts, plumes) stay ordinary objects.
   const replaced = skipKey !== null && o.userData?.assetContent === skipKey;
@@ -1183,7 +1197,7 @@ function walkObject(o: THREE.Object3D, cam: THREE.Camera, skipKey: string | null
       childSkip = swap.key;
     } else if ((o as unknown as {isLineSegments2?: boolean}).isLineSegments2) emitFatLine(o as THREE.Mesh);
     else if ((o as THREE.SkinnedMesh).isSkinnedMesh && emitSkeletal(o as THREE.SkinnedMesh)) { /* an Unreal skeletal mesh draws it */ }
-    else if ((o as THREE.Mesh).isMesh) emitMesh(o as THREE.Mesh);
+    else if ((o as THREE.Mesh).isMesh) { const m = textStandIn(o as THREE.Mesh, syncMaterial); if (m) emitMesh(m); }
     else if ((o as THREE.Points).isPoints) emitPrimitive(o as THREE.Points, POINTS, 1);
     else if ((o as THREE.Line).isLine) emitPrimitive(o as THREE.Line, LINES, (o as THREE.LineSegments).isLineSegments ? 2 : (o as THREE.LineLoop).isLineLoop ? 4 : 3);
     else if ((o as THREE.Light).isLight) emitLight(o as THREE.Light);
@@ -1243,6 +1257,7 @@ export function exportFrame(): number {
   if (unrealEffects) beginEffects(flags, cam, top);
   mountRecords.length = 0;
   newGeometryMs = 0; budgetOn = !host.fixedStepMs;
+  setDrawEye(cam);
   walk(top, cam, null);
   flushBatches();
   if (unrealEffects) emitEffectLights();
@@ -1258,10 +1273,13 @@ export function exportFrame(): number {
     pushMatrix(ccam.matrixWorld); push(ccam.isPerspectiveCamera ? ccam.fov : 0); push(ccam.near ?? 0.1); push(ccam.far ?? 1000);
     const cbg = scene.background as THREE.Color | null;
     push(cbg?.isColor ? 1 : 0); push(cbg?.isColor ? cbg.r : 0); push(cbg?.isColor ? cbg.g : 0); push(cbg?.isColor ? cbg.b : 0);
+    setDrawEye(ccam);
     walk(scene, ccam, null);
     flushBatches();
     push(10);
   }
+  exportPostPasses((kind, parameters) => emitEvent(kind, '', parameters)); // postPasses.ts: the composer chain as post materials
+  flushDrawOrders(e => pendingEvents.push(e));
   if (pendingEvents.length && out.events) { const events = pendingEvents; pendingEvents = []; out.events(JSON.stringify(events)); }
   out.frame(floats.buffer, n, inst.buffer, ni);
   // Release geometry the game has dropped (checked every few seconds).

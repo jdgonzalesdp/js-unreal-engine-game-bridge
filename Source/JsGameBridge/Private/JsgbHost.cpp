@@ -2,9 +2,14 @@
 #include "ShaderPipelineCache.h"
 #include "GameFramework/GameUserSettings.h"
 #include "JsgbBridge.h"
+#include "JsgbAddress.h"
 #include "JsgbSceneMirror.h"
 #include "JsgbAudio.h"
 #include "JsgbWorkers.h"
+#include "JsgbMacOverlay.h"
+#include "JsgbFiles.h"
+#include "JsgbCursor.h"
+#include "JsgbFrameCap.h"
 #include "JsEnv.h"
 #include "JSLogger.h"
 #include "JSModuleLoader.h"
@@ -215,6 +220,10 @@ private:
 		if (bDown && !E.IsRepeat() && H->HandleDlssKey(E.GetKey())) { return true; }
 		// The camera rig sees every key first (the overlay page still gets it and passes it to the game as before).
 		if (H->Bridge && H->Bridge->CameraRig.IsActive() && !E.IsRepeat()) { const FString RigCode = DomCode(E.GetKey()); if (!RigCode.IsEmpty()) { H->Bridge->CameraRig.Key(RigCode, bDown); } }
+#if PLATFORM_MAC
+		// Cmd+C, Cmd+X and Cmd+V reach the overlay page as keys, before the Mac browser widget runs its own commands for them.
+		if (bDown && H->HasOverlay() && JsgbMacSendClipboardKeyToPage(E)) { return true; }
+#endif
 		if (H->HasOverlay()) { return false; }
 		const FString Code = DomCode(E.GetKey());
 		if (Code.IsEmpty()) { return false; }
@@ -276,6 +285,9 @@ void UJsgbUIPort::SendInput(const FString& Json)
 		if (At >= 0) { AppliedCssVersion = FCString::Atoi(*Json.Mid(At + 10, 12)); }
 		return;
 	}
+	// The CSS cursor under the mouse in the overlay; the host's Tick has Slate show it (JsgbCursor.h).
+	EMouseCursor::Type Cursor;
+	if (JsgbReadCursorPacket(Json, Cursor)) { bPageCursorChanged |= !PageCursor.IsSet() || *PageCursor != Cursor; PageCursor = Cursor; return; }
 	if (UJsgbBridge* B = Bridge) { B->RunOnJs([B, Json] { if (B->OnUIInput.IsBound()) { B->OnUIInput.Execute(Json); } }); }
 }
 
@@ -362,7 +374,8 @@ bool AJsgbHost::LoadPublication(const FString& Dir, const FString& OverrideBundl
 	BundlePath = !OverrideBundle.IsEmpty() ? OverrideBundle : Bundle.IsEmpty() ? FString() : InGameDir(Bundle);
 	Pub->TryGetStringField(TEXT("sourceCommit"), SourceCommit);
 	Pub->TryGetStringField(TEXT("title"), Title);
-	BundleSHA256 = BundlePath.IsEmpty() ? FString() : Sha256File(BundlePath);
+	{ double Fps = 0; Pub->TryGetNumberField(TEXT("sceneFps"), Fps); JsgbSceneFrameCap().Published = static_cast<float>(Fps); }
+	BundleSHA256 =BundlePath.IsEmpty() ? FString() : Sha256File(BundlePath);
 	Search = Arg(TEXT("JsgbSearch="), Pub->HasField(TEXT("search")) ? Pub->GetStringField(TEXT("search")) : FString());
 	PublicRoots.Reset();
 	const TArray<TSharedPtr<FJsonValue>>* Roots = nullptr;
@@ -750,6 +763,8 @@ void AJsgbHost::StartJs()
 	if (!FParse::Param(FCommandLine::Get(), TEXT("JsgbGameThreadWorkers"))) { FFileHelper::LoadFileToString(Bridge->WorkerRuntime, *(GameDir / TEXT("jsgb/worker-runtime.js"))); }
 	Bridge->Registry = RegistryJson;
 	Bridge->BundlePath = BundlePath;
+	Bridge->ConfigureNet();
+	Bridge->ConfigureAddress();
 	Bridge->PublicRoots = PublicRoots;
 	const FString GameId = FPaths::GetBaseFilename(BundlePath);
 	Bridge->StoreDir = FPaths::ProjectSavedDir() / TEXT("JsGameBridge") / GameId / TEXT("Store");
@@ -795,10 +810,52 @@ void AJsgbHost::StartJs()
 #endif
 }
 
+/** Before the game's JavaScript stops (the end of play, a quit, a hot reload): the page hears it is leaving
+ *  (beforeunload, pagehide, visibilitychange to hidden) and gets up to 2 s to finish what that starts, its IndexedDB
+ *  writes above all, before its storage is written out (Runtime/src/leave.ts). Each __jsgb.leave() call is one step:
+ *  the promise jobs it starts run as the call returns, on whichever thread runs the JavaScript. When time is up, one
+ *  last call writes out whatever there is. A bundle without leave answers true at once. */
+static bool LeavePage(UJsgbBridge* Bridge, FJsgbJsThread* Thread)
+{
+	if (!Bridge || !Bridge->OnEval.IsBound()) { return true; }
+	struct FStep { FString Text; FEvent* Done = FPlatformProcess::GetSynchEventFromPool(true); ~FStep() { FPlatformProcess::ReturnSynchEventToPool(Done); } };
+	// One call: true when the page is done (or has no leave step), false while it is still busy, empty when the
+	// JavaScript thread did not answer in time.
+	auto Call = [Bridge, Thread](const TCHAR* Source, double WaitSeconds) -> FString
+	{
+		const FString Code(Source);
+		if (!Bridge->bJsThread || !Thread) { return Bridge->OnEval.IsBound() ? Bridge->OnEval.Execute(Code) : FString(TEXT("true")); }
+		TSharedRef<FStep, ESPMode::ThreadSafe> Reply = MakeShared<FStep, ESPMode::ThreadSafe>();
+		Bridge->RunOnJs([Bridge, Code, Reply] { Reply->Text = Bridge->OnEval.IsBound() ? Bridge->OnEval.Execute(Code) : FString(TEXT("true")); Reply->Done->Trigger(); });
+		Thread->Poke();
+		return Reply->Done->Wait(FMath::Max(1, static_cast<int32>(FMath::CeilToDouble(WaitSeconds * 1000.0)))) ? Reply->Text : FString();
+	};
+	// The 2 s count from the first answer: the page's own leave handlers run inside that first call.
+	double Until = FPlatformTime::Seconds() + 2.0;
+	for (bool bFirst = true; FPlatformTime::Seconds() < Until; bFirst = false)
+	{
+		const FString Answer = Call(TEXT("(globalThis.__jsgb&&__jsgb.leave)?__jsgb.leave():true"), Until - FPlatformTime::Seconds());
+		if (bFirst) { Until = FPlatformTime::Seconds() + 2.0; }
+		if (Answer == TEXT("true")) { return true; }
+		// Still busy goes on; no answer from the JavaScript thread, or an error, goes to the forced step.
+		if (Answer != TEXT("false")) { if (!Answer.IsEmpty()) { Bridge->Log(TEXT("warn"), TEXT("leave step: ") + Answer.Left(500)); } break; }
+		FPlatformProcess::SleepNoStats(0.001f);
+	}
+	const bool bDone = Call(TEXT("(globalThis.__jsgb&&__jsgb.leave)?__jsgb.leave(true):true"), 0.5) == TEXT("true");
+	Bridge->Log(TEXT("warn"), TEXT("the page was still saving after 2 s when the game stopped; its storage was written out as it was"));
+	return bDone;
+}
+
 void AJsgbHost::StopJs()
 {
-	// The JavaScript thread stops first, so nothing runs JavaScript while the engine is torn down.
+	// The page leaves first, while everything it may still call is in place.
+	const bool bLeft = LeavePage(Bridge, JsThread.Get());
+	const bool bThreaded = JsThread.IsValid();
+	// Then the JavaScript thread stops, so nothing runs JavaScript while the engine is torn down.
 	JsThread.Reset();
+	// A JavaScript thread still busy when the wait ran out stopped before it ran the forced step: it runs here (Puerts
+	// built THREAD_SAFE locks the engine for whichever thread calls in), so storage is still written out.
+	if (!bLeft && bThreaded && Bridge && Bridge->OnEval.IsBound()) { Bridge->OnEval.Execute(TEXT("(globalThis.__jsgb&&__jsgb.leave)?__jsgb.leave(true):true")); }
 	if (Bridge)
 	{
 		Bridge->DrainGameCommands();
@@ -806,7 +863,7 @@ void AJsgbHost::StopJs()
 		Mirror->bInterpolate = false;
 		Bridge->StopWorkers();
 		Bridge->OnFrame.Clear(); Bridge->OnUIInput.Clear(); Bridge->OnKey.Clear(); Bridge->OnMouse.Clear();
-		Bridge->OnWheel.Clear(); Bridge->OnViewport.Clear(); Bridge->OnGamepads.Clear(); Bridge->OnEval.Clear();
+		Bridge->OnWheel.Clear(); Bridge->OnViewport.Clear(); Bridge->OnGamepads.Clear(); Bridge->OnEval.Clear(); Bridge->OnNavigate.Clear();
 		Bridge->Mirror = nullptr; Bridge->Audio = nullptr;
 	}
 	JsEnv.Reset();
@@ -822,6 +879,15 @@ void AJsgbHost::CreateOverlay()
 	FString Client;
 	const FString PluginDir = IPluginManager::Get().FindPlugin(TEXT("JsGameBridge"))->GetBaseDir();
 	FFileHelper::LoadFileToString(Client, *(PluginDir / TEXT("JavaScript/jsgb-ui-client.js")));
+	// Then every other JavaScript/jsgb-ui-*.js, in name order: the overlay's text editing, selection and scrolling.
+	TArray<FString> UiScripts;
+	IFileManager::Get().FindFiles(UiScripts, *(PluginDir / TEXT("JavaScript/jsgb-ui-*.js")), true, false);
+	UiScripts.Sort();
+	for (const FString& Name : UiScripts)
+	{
+		FString Part;
+		if (Name != TEXT("jsgb-ui-client.js") && FFileHelper::LoadFileToString(Part, *(PluginDir / TEXT("JavaScript") / Name))) { Client += TEXT("\n") + Part; }
+	}
 	UIPort = NewObject<UJsgbUIPort>(this);
 	UIPort->Bridge = Bridge;
 	// The overlay page's frame cap. The browser draws a frame only when the page changed, so this caps how often an
@@ -844,6 +910,10 @@ void AJsgbHost::CreateOverlay()
 		})
 		.OnBeforePopup_Lambda([](FString, FString) { return true; });
 	Browser->BindUObject(TEXT("jsgb"), UIPort, true);
+#if PLATFORM_MAC
+	// The Mac browser widget leaves the cursor to the game view behind it, which showed the arrow over WebKit's cursor.
+	JsgbShowPageCursor(*Browser, UIPort);
+#endif
 	GEngine->GameViewport->AddViewportWidgetContent(Browser.ToSharedRef(), 100);
 	const FString Origin = FString::Printf(TEXT("http://127.0.0.1:%d/"), Port);
 	// The page's own stylesheets, with every full-screen background made transparent so the
@@ -1008,6 +1078,29 @@ void AJsgbHost::StartServer()
 			Resp->Code = Code;
 			Done(MoveTemp(Resp));
 		};
+		// A sign-in coming back from the system browser to one of the game's callback paths (JsgbAddress.cpp).
+		if (FJsgbAddress::HandleCallback(R, Done, H->Bridge)) { return true; }
+		// No web page may drive the bridge. A name other than the loopback address (DNS rebinding) is refused outright,
+		// and a POST to /bridge/* from a browser page on another site too: browsers send Sec-Fetch-Site and an Origin,
+		// tools (curl, Node) send neither, and the overlay's own page is same-origin.
+		{
+			const TArray<FString>* HostValues = R.Headers.Find(TEXT("host"));
+			const FString HostHeader = HostValues && HostValues->Num() ? (*HostValues)[0].TrimStartAndEnd().ToLower() : FString();
+			const FString OnPort = FString::Printf(TEXT(":%d"), H->Port);
+			if (!HostHeader.IsEmpty() && HostHeader != TEXT("127.0.0.1") + OnPort && HostHeader != TEXT("localhost") + OnPort && HostHeader != TEXT("[::1]") + OnPort)
+			{
+				Done(FHttpServerResponse::Error(EHttpServerResponseCodes::Forbidden)); return true;
+			}
+			if (bPost && Route.StartsWith(TEXT("/bridge/")))
+			{
+				const TArray<FString>* Site = R.Headers.Find(TEXT("sec-fetch-site"));
+				const TArray<FString>* From = R.Headers.Find(TEXT("origin"));
+				const FString Origin = From && From->Num() ? (*From)[0].TrimStartAndEnd().ToLower() : FString();
+				const bool bCrossSite = Site && Site->Num() && (*Site)[0] != TEXT("same-origin") && (*Site)[0] != TEXT("none");
+				const bool bForeign = !Origin.IsEmpty() && Origin != TEXT("http://127.0.0.1") + OnPort && Origin != TEXT("http://localhost") + OnPort;
+				if (bCrossSite || bForeign) { Done(FHttpServerResponse::Error(EHttpServerResponseCodes::Forbidden)); return true; }
+			}
+		}
 		if (Route.StartsWith(TEXT("/bridge/blob/")))
 		{
 			// A blob URL in the overlay's copy of the page (an image the game made): its shared bytes (FJsgbBlobs).
@@ -1835,18 +1928,32 @@ void AJsgbHost::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	++Frame;
+#if PLATFORM_MAC
+	// The Mac overlay is a native web view the engine creates and may replace; keep it transparent (JsgbMacOverlay.mm).
+	if (Browser.IsValid() && Frame % 30 == 1) { JsgbMakeMacWebViewsTransparent(); }
+	// Files dropped on the overlay reach the page's drop event (JsgbOpenPanelMac.mm, Runtime/src/dragDrop.ts).
+	if (Browser.IsValid() && Frame % 30 == 1) { JsgbWatchFileDrops(); }
+	// A new cursor from the overlay page shows now, not at the next mouse move (JsgbCursor.h).
+	if (UIPort && UIPort->bPageCursorChanged) { UIPort->bPageCursorChanged = false; JsgbRequeryCursor(); }
+#endif
 	GJsgbWindowFocus.store(FSlateApplication::IsInitialized() && FSlateApplication::Get().IsActive(), std::memory_order_relaxed);
-	// A mirrored scene can present at its simulation cadence, independently of page-game caps. -JsgbSceneFps is the
-	// default cap. A frame cap the player saved in the game's display settings (unlimited too) wins over it. Unreal's own
-	// start-up settings and the game user settings file also set t.MaxFPS, so the default is set again whenever it differs.
-	static const float SceneFps = [] { float Fps = 0; FParse::Value(FCommandLine::Get(), TEXT("JsgbSceneFps="), Fps); return FMath::Clamp(Fps, 0.f, 240.f); }();
-	if (SceneFps > 0 && !IsPageGame())
+	// A mirrored scene can present at its simulation cadence, independently of page-game caps. -JsgbSceneFps, else the
+	// game config's "sceneFps", is the default cap. A frame cap the player saved in the game's display settings (unlimited
+	// too) wins over it. Unreal's own start-up settings and the game user settings file also set t.MaxFPS, so the default
+	// is set again whenever it differs. The page can lower the cap while it runs (window.jsgb.setFrameRate, JsgbFrameCap.h).
+	static const float ArgSceneFps = [] { float Fps = -1; FParse::Value(FCommandLine::Get(), TEXT("JsgbSceneFps="), Fps); return Fps; }();
+	FJsgbFrameCap& FrameCap = JsgbSceneFrameCap();
+	const float SceneFps = FMath::Clamp(ArgSceneFps >= 0 ? ArgSceneFps : FrameCap.Published, 0.f, 240.f);
+	const float AskedFps = Bridge ? Bridge->AskedFrameRate.load(std::memory_order_relaxed) : 0.f;
+	if ((SceneFps > 0 || AskedFps > 0 || FrameCap.IsAsked()) && !IsPageGame())
 	{
 		// The external frame-generation pacer claims the cap even with generation off. Use the engine's clock.
 		static IConsoleVariable* Pacer = IConsoleManager::Get().FindConsoleVariable(TEXT("t.Streamline.Reflex.HandleMaxTickRate"));
 		if (Pacer && Pacer->GetInt() != 0) { Pacer->Set(0, ECVF_SetByCode); }
 		static IConsoleVariable* MaxFps = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS"));
-		if (MaxFps && !(Bridge && Bridge->bSavedFrameCap) && MaxFps->GetFloat() != SceneFps) { JsgbSetFrameCap(MaxFps, SceneFps); }
+		UGameUserSettings* Saved = Bridge && Bridge->bSavedFrameCap && GEngine ? GEngine->GetGameUserSettings() : nullptr;
+		const float Want = MaxFps ? FrameCap.Want(MaxFps->GetFloat(), SceneFps, Saved ? Saved->GetFrameRateLimit() : -1.f, AskedFps) : -1.f;
+		if (Want >= 0 && MaxFps->GetFloat() != Want) { JsgbSetFrameCap(MaxFps, Want); }
 	}
 	UpdateHud(DeltaSeconds);
 	// A page game loading files: Unreal ticks up to PageLoadFps until a second after the last request, then returns to the
@@ -1921,7 +2028,17 @@ void AJsgbHost::Tick(float DeltaSeconds)
 
 	FIntPoint Size(1920, 1080);
 	if (UGameViewportClient* Vp = GetWorld()->GetGameViewport()) { FVector2D S; Vp->GetViewportSize(S); if (S.X > 0) { Size = FIntPoint(S.X, S.Y); } }
-	if (Size != Viewport) { Viewport = Size; Mirror->ViewportSize = Size; UJsgbBridge* B = Bridge; B->RunOnJs([B, Size] { if (B->OnViewport.IsBound()) { B->OnViewport.Execute(Size.X, Size.Y); } }); }
+	if (Size != Viewport)
+	{
+		Viewport = Size; Mirror->ViewportSize = Size;
+		// The page measures in CSS pixels. With high DPI on (a Retina Mac) the viewport is in device pixels, two per CSS
+		// pixel, and the overlay reports the CSS size: sending device pixels made the page size its canvas twice too big.
+		const TSharedPtr<SWindow> Window = GEngine && GEngine->GameViewport ? GEngine->GameViewport->GetWindow() : nullptr;
+		const float Dpi = Window.IsValid() && Window->GetNativeWindow().IsValid() ? FMath::Max(1.f, Window->GetNativeWindow()->GetDPIScaleFactor()) : 1.f;
+		const FIntPoint Css(FMath::RoundToInt(Size.X / Dpi), FMath::RoundToInt(Size.Y / Dpi));
+		Mirror->PixelScale = Dpi;
+		UJsgbBridge* B = Bridge; B->RunOnJs([B, Css] { if (B->OnViewport.IsBound()) { B->OnViewport.Execute(Css.X, Css.Y); } });
+	}
 
 	if (ReadyFrame < 0 && Bridge->bReady) { ReadyFrame = Frame; ReadySeconds = GameSeconds(); CaptureStart = ReadySeconds; Bridge->Log(TEXT("log"), FString::Printf(TEXT("game ready at host frame %lld"), Frame)); }
 	RunScript();
@@ -1933,7 +2050,10 @@ void AJsgbHost::Tick(float DeltaSeconds)
 	// A frame much longer than 60 FPS allows gets a breakdown of the tick before it, and the engine's times.
 	// -JsgbSlowFrameMs=<ms> lowers the threshold, to see what the frames just over 16.7 ms are made of.
 	static const float SlowFrameMs = [] { float Ms = 34.f; FParse::Value(FCommandLine::Get(), TEXT("JsgbSlowFrameMs="), Ms); return Ms; }();
-	if (ReadyFrame >= 0 && DeltaSeconds * 1000.f > SlowFrameMs && LastTick.Num() == 11)
+	// A cap that spaces frames wider than that on purpose (a 24 fps camera view, JsgbFrameCap.h) makes slow one and a half of its frames.
+	static IConsoleVariable* CapVar = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS"));
+	const float CapFrameMs = CapVar && CapVar->GetFloat() > 0.f ? 1000.f / CapVar->GetFloat() : 0.f;
+	if (ReadyFrame >= 0 && DeltaSeconds * 1000.f > (CapFrameMs >= SlowFrameMs ? 1.5f * CapFrameMs : SlowFrameMs) && LastTick.Num() == 11)
 	{
 		Bridge->Log(TEXT("log"), FString::Printf(TEXT("slow frame %lld: %.0f ms; previous tick: js %.1f ms (mirror %.1f: materials %.1f in %d, textures %.1f, meshes %.1f, instanced %.1f, build queue %.1f in %d builds, stall %.1f), ui %.1f ms; engine: game thread %.1f, render thread %.1f, RHI thread %.1f, GPU %.1f ms"),
 			Frame, DeltaSeconds * 1000.f, LastTick[0], LastTick[1], LastTick[6], static_cast<int32>(LastTick[7]), LastTick[8], LastTick[9], LastTick[10], LastTick[2], static_cast<int32>(LastTick[3]), LastTick[4], LastTick[5],

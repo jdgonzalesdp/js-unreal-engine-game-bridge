@@ -206,9 +206,16 @@ FString UJsgbBridge::LoadStore(const FString& Key)
 	return Data;
 }
 
-void UJsgbBridge::SaveStore(const FString& Key, const FString& Data)
+bool UJsgbBridge::SaveStore(const FString& Key, const FString& Data)
 {
-	FFileHelper::SaveStringToFile(Data, *(StoreDir / StoreFile(Key)), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	// False for a file that could not be written (a full disk): IndexedDB keeps that write queued and tries it again.
+	return FFileHelper::SaveStringToFile(Data, *(StoreDir / StoreFile(Key)), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+}
+
+void UJsgbBridge::RemoveStore(const FString& Key)
+{
+	// Only the game's own Store folder: a package's read-only seed entries stay as they are.
+	IFileManager::Get().Delete(*(StoreDir / StoreFile(Key)), false, false, true);
 }
 
 // Process-wide, so it survives the JS environment restart of a hot reload. Past 4 GB the oldest

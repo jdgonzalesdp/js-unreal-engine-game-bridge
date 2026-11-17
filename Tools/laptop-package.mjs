@@ -184,6 +184,8 @@ for (const id of games) {
       if (fs.existsSync(path.join(game.out, name))) copy(path.join(game.out, name), path.join(dest, name));
     }
     mirror(path.join(game.out, 'jsgb'), path.join(dest, 'jsgb'));
+    // Files the bundle names by URL (?url imports, new URL(..., import.meta.url): Tools/vite-assets.mjs).
+    if (fs.existsSync(path.join(game.out, 'assets'))) mirror(path.join(game.out, 'assets'), path.join(dest, 'assets'));
     mirror(path.join(game.out, 'jsgb-store'), path.join(dest, 'jsgb-store'));
     copy(path.join(game.repo, game.index ?? 'index.html'), path.join(dest, game.index ?? 'index.html'));
     pub.bundle = bundle;

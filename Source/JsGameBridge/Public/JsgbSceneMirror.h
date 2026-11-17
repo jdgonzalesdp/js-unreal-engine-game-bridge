@@ -97,6 +97,8 @@ struct FJsgbMaterial
 	/** A fat line's width (Line2): in pixels, or in world units; 0 for an ordinary one-pixel line. */
 	float FatWidth = 0.f;
 	bool bFatWorld = false;
+	/** three.js depthTest: false. Its lines draw on top of everything (SDPG_Foreground). */
+	bool bNoDepthTest = false;
 	/** three.js draws it opaque without writing depth (a sky dome drawn first): Unreal draws it translucent, first. */
 	bool bDrawFirst = false;
 	/** Its generated material moves vertices in the vertex shader (world position offset: camera-facing sprites). */
@@ -321,6 +323,8 @@ public:
 	int32 EmptyBuilds = 0;
 	int32 PendingBuilds() const { return BuildQueue.Num(); }
 	FIntPoint ViewportSize = FIntPoint(1920, 1080);
+	/** Device pixels per CSS pixel (2 on a Retina Mac with high DPI on). Line widths are CSS pixels, as in the browser. */
+	float PixelScale = 1.f;
 
 private:
 	UStaticMesh* BuildMesh(const FJsgbPendingGeometry& G, int32& OutSlots);

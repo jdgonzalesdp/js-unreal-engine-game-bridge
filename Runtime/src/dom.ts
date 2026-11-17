@@ -1,11 +1,20 @@
 import {parseHTML} from 'linkedom';
+import * as linkedom from 'linkedom';
 import {installFastQueries, installNoOpSkips} from './query';
 import {host} from './host';
 import {blobStore, base64Bytes, bytesBase64} from './polyfills';
 import {imageSize} from './imageSize';
 import {isWebp,decodeWebp} from './webp';
 import {windowTarget} from './input';
+import {installLocation} from './location';
+import {installCookies} from './cookies';
+import {asWebStorage} from './webStorage';
+import {installResizeObserver, setLayoutSource} from './resizeObserver';
+import {stillFocused} from './focusFixup';
 import {Context2D, Path2DImpl, setImageReader, OffscreenCanvasImpl, ImageDataImpl, ImageBitmapImpl} from './canvas2d';
+import {installFilePicker} from './filePicker';
+import {installDialogs} from './dialogs';
+import {installPageApis} from './pageApis';
 
 /** The page the web build boots in, as a linkedom document. The game's UI code builds its DOM
  *  here exactly as it does in a browser; the Unreal host mirrors it into the CEF overlay. */
@@ -27,6 +36,9 @@ const CLASSES = ['Event', 'CustomEvent', 'InputEvent', 'EventTarget', 'Node', 'E
   'SVGElement', 'Text', 'Comment', 'DocumentFragment', 'Document', 'MutationObserver', 'DOMParser', 'Range', 'TreeWalker',
   'NodeFilter', 'Attr', 'CharacterData', 'ShadowRoot', 'HTMLCollection', 'NodeList', 'CSSStyleDeclaration', 'Image'];
 for (const name of CLASSES) if (page[name] && !g[name]) g[name] = page[name];
+// Every other element class linkedom defines (HTMLIFrameElement, HTMLTableRowElement ...). React DOM and UI libraries
+// test `x instanceof window.HTMLIFrameElement`, which throws when the class is missing.
+for (const [name, cls] of Object.entries(linkedom)) if (/^(HTML|SVG)\w*Element$/.test(name) && !g[name]) g[name] = cls;
 g.document = doc;
 installNoOpSkips(doc);
 installFastQueries(doc);
@@ -72,8 +84,8 @@ g.devicePixelRatio = 1; g.scrollX = g.scrollY = g.pageXOffset = g.pageYOffset = 
 g.screen = {width: VIEW.w, height: VIEW.h, availWidth: VIEW.w, availHeight: VIEW.h, orientation: {type: 'landscape-primary', addEventListener() {}}};
 g.scrollTo = g.scroll = g.scrollBy = () => {};
 g.focus = g.blur = () => {};
-g.alert = (m: string) => host.log('warn', 'alert: ' + m);
-g.confirm = () => true; g.prompt = () => null;
+// alert, confirm and prompt: the host's native dialogs, which the page waits for (dialogs.ts).
+installDialogs();
 g.open = () => null; g.close = () => {}; g.print = () => {};
 g.isSecureContext = true; g.origin = 'http://localhost';
 g.parent = g.top = g;
@@ -89,22 +101,12 @@ export function setViewport(w: number, h: number) {
 // reload or navigation writes them first, so a game that saves and then reloads keeps what it saved.
 const storageFlushes: (() => void)[] = [];
 export function flushStorage() { for (const flush of storageFlushes) flush(); }
-function navigate() { flushStorage(); host.reload(); }
-
-const search = host.search ?? '';
-let hash = '';
-// The host keeps its own search string, so setting href, search or pathname restarts the game at the
-// same address, as close as the host gets to a navigation. Changing only the hash stays on the page.
-g.location = {
-  get href() { return 'http://localhost/' + search + hash; }, set href(v: string) { const h = /#.*/.exec(String(v))?.[0] ?? ''; if (h && String(v).startsWith('#')) { hash = h; return; } navigate(); },
-  origin: 'http://localhost', protocol: 'http:', host: 'localhost', hostname: 'localhost', port: '',
-  get pathname() { return '/'; }, set pathname(_v: string) { navigate(); },
-  get search() { return search; }, set search(_v: string) { navigate(); },
-  get hash() { return hash; }, set hash(v: string) { hash = v ? (String(v).startsWith('#') ? String(v) : '#' + v) : ''; },
-  assign: () => navigate(), replace: () => navigate(), reload: () => navigate(), toString() { return this.href; },
-};
-g.history = {length: 1, state: null, pushState() {}, replaceState() {}, back() {}, forward() {}, go() {}, scrollRestoration: 'auto'};
-try { Object.defineProperty(doc, 'baseURI', {get: () => 'http://localhost/', configurable: true}); } catch { /* linkedom getter */ }
+/** Another store written out with the rest (indexedDb.ts). */
+export function onFlushStorage(flush: () => void) { storageFlushes.push(flush); }
+// The page's address (location.ts): history moves it in place, another path restarts the game there and another
+// origin opens in the system browser. document.cookie is kept in the host's store (cookies.ts).
+installLocation(doc, flushStorage);
+installCookies(doc);
 try { Object.defineProperty(doc, 'location', {get: () => g.location, configurable: true}); } catch { /* ignore */ }
 try { Object.defineProperty(doc, 'defaultView', {get: () => g, configurable: true}); } catch { /* ignore */ }
 try { Object.defineProperty(doc, 'visibilityState', {get: () => 'visible', configurable: true}); Object.defineProperty(doc, 'hidden', {get: () => false, configurable: true}); } catch { /* ignore */ }
@@ -121,15 +123,31 @@ export const pointerLocked = () => pointerLockElement !== null;
 
 // Layout: linkedom has no layout engine. The CEF overlay lays the mirrored page out and reports
 // each element's box back (see ui.ts). Until a box arrives, canvases and the body's direct
-// children report the viewport and everything else a zero box.
+// children report the viewport, an element sized in its inline style reports that size, and
+// everything else a zero box.
 const EP = page.HTMLElement.prototype as Record<string, any>;
 const ElP = page.Element.prototype as Record<string, any>;
-export const layoutBoxes = new Map<string, {x: number; y: number; width: number; height: number; display?: string; visibility?: string; opacity?: string}>();
+export const layoutBoxes = new Map<string, {x: number; y: number; width: number; height: number; cw?: number; ch?: number; display?: string; visibility?: string; opacity?: string}>();
 const fullScreen = (el: Record<string, any>) => el.tagName === 'CANVAS' || el.parentNode === doc.body || el === doc.body || el === doc.documentElement;
 function box(el: Record<string, any>) { const id = el.getAttribute?.('data-jsgb'); return id ? layoutBoxes.get(id) : undefined; }
+/** Inline `width`/`height` in px, or 100% of a parent that has a size. Measured containers (react-three-fiber's
+ *  <Canvas> wrapper) start only once they have a size, so they need one before the overlay's first report, and in
+ *  the Node smoke test, which has no overlay. */
+function styleSize(el: Record<string, any> | null, depth = 0): {w: number; h: number} | undefined {
+  if (!el || depth > 32) return undefined;
+  const b = box(el); if (b) return {w: b.width, h: b.height};
+  if (fullScreen(el)) return {w: VIEW.w, h: VIEW.h};
+  const s = el.style; if (!s) return undefined;
+  let parent: {w: number; h: number} | undefined | null = null;
+  const fromParent = () => (parent ??= styleSize(el.parentNode, depth + 1));
+  const dim = (v: string, axis: 'w' | 'h') => /^\d+(\.\d+)?px$/.test(v) ? parseFloat(v) : v === '100%' ? fromParent()?.[axis] : undefined;
+  const w = dim(String(s.width ?? ''), 'w'), h = dim(String(s.height ?? ''), 'h');
+  return w !== undefined && h !== undefined ? {w, h} : undefined;
+}
 ElP.getBoundingClientRect = function (this: Record<string, any>) {
   const b = box(this); if (b) return new g.DOMRect(b.x, b.y, b.width, b.height);
-  return fullScreen(this) ? new g.DOMRect(0, 0, VIEW.w, VIEW.h) : new g.DOMRect(0, 0, 0, 0);
+  const size = styleSize(this);
+  return size ? new g.DOMRect(0, 0, size.w, size.h) : new g.DOMRect(0, 0, 0, 0);
 };
 ElP.getClientRects = function (this: Record<string, any>) { return this.isConnected && this.style?.display !== 'none' && !this.hidden ? [this.getBoundingClientRect()] : []; };
 ElP.scrollIntoView ??= () => {}; ElP.scrollTo ??= () => {}; ElP.scrollBy ??= () => {};
@@ -143,7 +161,8 @@ let activeElement: unknown = null;
 EP.focus = function () { activeElement = this; };
 EP.blur = function () { if (activeElement === this) activeElement = null; };
 EP.click ??= function (this: Record<string, any>) { this.dispatchEvent(new g.MouseEvent('click', {bubbles: true, cancelable: true})); };
-try { Object.defineProperty(doc, 'activeElement', {get: () => activeElement ?? doc.body, configurable: true}); } catch { /* ignore */ }
+// A focused element that left the document gives focus back to the body (focusFixup.ts).
+try { Object.defineProperty(doc, 'activeElement', {get: () => (activeElement = stillFocused(activeElement)) ?? doc.body, configurable: true}); } catch { /* ignore */ }
 for (const prop of ['offsetWidth', 'offsetHeight', 'offsetLeft', 'offsetTop', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight'] as const) {
   if (!(prop in EP) || prop.startsWith('offset') || prop.startsWith('client')) Object.defineProperty(EP, prop, {get() {
     const r = this.getBoundingClientRect();
@@ -173,7 +192,9 @@ g.getComputedStyle = (el: Record<string, any>) => new Proxy(el?.style ?? {}, {
 });
 g.matchMedia = (q: string) => ({matches: /prefers-reduced-motion: no-preference|min-width|hover: hover|pointer: fine/.test(q), media: q, onchange: null,
   addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => true});
-g.ResizeObserver ??= class { constructor(private cb: (e: unknown[]) => void) {} observe(t: unknown) { setTimeout(() => this.cb([{target: t, contentRect: new g.DOMRect(0, 0, VIEW.w, VIEW.h)}]), 0); } unobserve() {} disconnect() {} };
+// Resize observers report the overlay's real layout as it changes (resizeObserver.ts).
+setLayoutSource(box);
+installResizeObserver();
 g.IntersectionObserver ??= class { constructor(private cb: (e: unknown[]) => void) {} observe(t: unknown) { setTimeout(() => this.cb([{target: t, isIntersecting: true, intersectionRatio: 1}]), 0); } unobserve() {} disconnect() {} takeRecords() { return []; } };
 g.CSS ??= {supports: () => true, escape: (s: string) => s.replace(/[^\w-]/g, c => '\\' + c)};
 
@@ -219,8 +240,8 @@ function makeStorage(kind: string) {
     clear: () => { const keys = [...m.keys()]; m.clear(); indexDirty = true; for (const k of keys) dirty.add(k); touch(null); },
   };
 }
-g.localStorage = makeStorage('localStorage');
-g.sessionStorage = makeStorage('sessionStorage');
+g.localStorage = asWebStorage(makeStorage('localStorage'));
+g.sessionStorage = asWebStorage(makeStorage('sessionStorage'));
 
 // Canvas. 2D contexts rasterize in software (canvas2d.ts) so runtime-drawn textures carry over.
 // WebGL contexts are absent: Unreal draws the world.
@@ -429,6 +450,8 @@ class FormDataImpl {
       const name = el.getAttribute('name'); if (!name || el.hasAttribute('disabled')) continue;
       const type = (el.getAttribute('type') ?? '').toLowerCase();
       if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+      // A file input gives each chosen File, or one empty File when none is chosen, as browsers do.
+      if (type === 'file') { const picked = [...(el.files ?? [])]; for (const f of picked.length ? picked : [new g.File([], '', {type: 'application/octet-stream'})]) this.list.push([name, f]); continue; }
       if (type === 'submit' || type === 'button' || type === 'reset' || type === 'file') continue;
       this.list.push([name, type === 'checkbox' || type === 'radio' ? (el.getAttribute('value') ?? 'on') : String(el.value ?? el.getAttribute('value') ?? el.textContent ?? '')]);
     }
@@ -460,3 +483,9 @@ if (FormP) {
   FormP.reset ??= function () {};
   FormP.checkValidity ??= () => true; FormP.reportValidity ??= () => true;
 }
+
+// <input type=file>, showOpenFilePicker and showDirectoryPicker over the host's open panel (filePicker.ts).
+installFilePicker(page);
+
+// FontFace and document.fonts, IntersectionObserver over the overlay's layout, and real <form> elements (pageApis.ts).
+installPageApis(page, layoutBoxes, box);

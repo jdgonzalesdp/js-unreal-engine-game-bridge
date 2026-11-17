@@ -68,7 +68,13 @@ export class UnrealWorker {
         // The worker sees its own self/postMessage/onmessage, and the page's fetch and WebAssembly.
         const scope = this.scope as unknown as Record<string, any>;
         scope.self = scope; scope.location = new g.URL(url.startsWith('blob:') ? 'http://localhost/worker.js' : url, 'http://localhost/'); scope.navigator = g.navigator;
-        scope.importScripts = (...urls: string[]) => { for (const u of urls) { const b = host.readFile(resolveAssetPath(u)); if (b) new Function('self', new g.TextDecoder().decode(b))(scope); } };
+        // An imported script may be a blob the worker made (troika-worker-utils rebuilds its functions this way), and
+        // its free names (troikaDefine) are the worker's globals: `with (self)` resolves them on the scope first.
+        scope.importScripts = (...urls: string[]) => { for (const u of urls) {
+          const b = (blobStore.get(u) as {bytes?: Uint8Array} | undefined)?.bytes ?? (u.startsWith('blob:') ? null : host.readFile(resolveAssetPath(u)));
+          if (!b) throw Error('importScripts: not found: ' + u);
+          new Function('self', `with (self) {\n${new g.TextDecoder().decode(b)}\n}`)(scope);
+        } };
         const run = new Function('self', 'globalThis', 'postMessage', 'addEventListener', 'removeEventListener', 'close', 'importScripts',
           `let onmessage = null; const WorkerGlobalScope = {[Symbol.hasInstance]: o => o === self}, DedicatedWorkerGlobalScope = WorkerGlobalScope;\n${text}\n;return () => onmessage;`);
         const handler = run(scope, scope, (d: unknown) => scope.postMessage(d), (t: string, f: Listener) => scope.addEventListener(t, f), (t: string, f: Listener) => scope.removeEventListener(t, f), () => scope.close(), scope.importScripts);

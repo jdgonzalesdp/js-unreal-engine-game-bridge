@@ -27,10 +27,21 @@ const timeout = +flag('--timeout', 900) * 1000;
 const [resX, resY] = flag('--res', '1920x1080').split('x');
 
 export function unrealProcesses() {
+  // Mac and Linux: the editor or game binary by name (pgrep exits 1 when nothing matches).
+  if (process.platform !== 'win32') {
+    try { return execFileSync('pgrep', ['-lx', 'UnrealEditor|UnrealEditor-Cmd|UnrealGame'], {encoding: 'utf8'}).split('\n').filter(Boolean); } catch { return []; }
+  }
   try {
     return execFileSync('tasklist', ['/FO', 'CSV', '/NH'], {encoding: 'utf8'}).split(/\r?\n/)
       .map(l => l.split('","')[0]?.replace(/^"/, '')).filter(n => /^Unreal(Editor|Editor-Cmd|Game)?.*\.exe$/i.test(n ?? '') && !/TraceServer|CrashReport/i.test(n));
   } catch { return []; }
+}
+
+/** <engine>/Engine, from the editor binary: Engine/Binaries/Win64/UnrealEditor.exe, or on a Mac
+ *  Engine/Binaries/Mac/UnrealEditor.app/Contents/MacOS/UnrealEditor. */
+function engineRoot() {
+  const binaries = engine.split(/[\\/]Binaries[\\/]/)[0];
+  return binaries === engine ? path.resolve(path.dirname(engine), '../..') : binaries;
 }
 
 // One Unreal at a time across all agents: wait for the slot.
@@ -61,9 +72,10 @@ ${r.stderr.trim()}`); return; }
   // Puerts and the bridge (which checks THREAD_SAFE when it compiles) are built once with the patch.
   const name = path.basename(project, '.uproject');
   const target = fs.existsSync(path.join(path.dirname(project), 'Source', `${name}Editor.Target.cs`)) ? `${name}Editor` : 'UnrealEditor';
-  const buildBat = path.resolve(path.dirname(engine), '../../Build/BatchFiles/Build.bat');
   console.log(`--js-thread: building ${target} with the thread-safe Puerts (once, a few minutes)`);
-  const b = spawnSync('cmd', ['/c', buildBat, target, 'Win64', 'Development', `-Project=${project}`, '-WaitMutex'], {stdio: 'inherit'});
+  const b = process.platform === 'darwin'
+    ? spawnSync(path.join(engineRoot(), 'Build/BatchFiles/Mac/Build.sh'), [target, 'Mac', 'Development', `-Project=${project}`, '-WaitMutex', '-NoUBA'], {stdio: 'inherit'})
+    : spawnSync('cmd', ['/c', path.resolve(path.dirname(engine), '../../Build/BatchFiles/Build.bat'), target, 'Win64', 'Development', `-Project=${project}`, '-WaitMutex'], {stdio: 'inherit'});
   if (b.status !== 0) throw Error(`--js-thread: the editor build failed (exit ${b.status}); see the output above`);
   fs.mkdirSync(path.dirname(stamp), {recursive: true});
   fs.writeFileSync(stamp, `${new Date().toISOString()} built ${target} with Patches/puerts-thread-safe.patch

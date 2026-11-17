@@ -3,9 +3,17 @@
  *  worker by calling __dispatch(bytes) for each message and __tick() for timers. Messages travel as
  *  bytes in the structured-clone subset of clone.ts. */
 import {blobStore} from './polyfills';
+// The page's locale fixes, so a worker formats, sorts and normalizes text as the page does: a time zone's local time
+// (timeZones.ts), localeCompare and Intl.Collator (collation.ts) and String.prototype.normalize (textNormalize.ts).
+import './textNormalize';
+import './collation';
+import './timeZones';
 import {encode, decode} from './clone';
 import {Context2D, Path2DImpl, OffscreenCanvasImpl, ImageDataImpl, ImageBitmapImpl} from './canvas2d';
 import {Headers, Response, Request, MIME} from './fetchCore';
+import {createNetFetch} from './netFetch';
+import {installXMLHttpRequest} from './xhr';
+import {installConvertToBlob} from './imageEncode';
 
 type Native = {
   __post(bytes: ArrayBuffer): void; __log(level: string, text: string): void; __now(): number;
@@ -98,18 +106,26 @@ const bytesOf = (url: string): ArrayBuffer | null => {
 g.importScripts = (...urls: string[]) => {
   for (const u of urls) { const b = bytesOf(u); if (!b) throw Error('importScripts: not found: ' + u); (0, eval)(new g.TextDecoder().decode(b)); }
 };
-// fetch reads the game's own files (and blob/data URLs); anything else answers 503, as on the page.
+// fetch reads the game's own files (and blob/data URLs). Network URLs go through the worker's native calls
+// (JsgbWorkers.cpp, to the same host allow list as the page); without them they answer 503.
+const netFetch = createNetFetch(() => typeof g.__httpStart === 'function' && typeof g.__httpTake === 'function'
+  ? {start: (m, u, h, b) => g.__httpStart(m, u, h, b), take: id => { const r = g.__httpTake(id); return r && r.byteLength > 0 ? r : null; }} : null);
 g.Headers ??= Headers; g.Response ??= Response; g.Request ??= Request;
 g.fetch = async (input: string | {url: string}, init?: {method?: string}) => {
   const url = typeof input === 'string' ? input : String(input?.url ?? input);
   const local = url.startsWith('blob:') || url.startsWith('data:') || new g.URL(url, 'http://localhost/').hostname === 'localhost';
-  if (!local || (init?.method && init.method !== 'GET')) return new Response(null, 503, url);
+  if (!local) return netFetch(new g.URL(url, 'http://localhost/').href, init as Parameters<typeof netFetch>[1]);
+  if (init?.method && init.method.toUpperCase() !== 'GET') return new Response(null, 503, url);
   const b = bytesOf(url), ext = url.split(/[?#]/)[0].split('.').pop()?.toLowerCase() ?? '';
   return new Response(b, b ? 200 : 404, url, MIME[ext] ?? '');
 };
 
+// XMLHttpRequest over the worker's fetch (troika-three-text loads its font files with it).
+if (!g.XMLHttpRequest) installXMLHttpRequest(g, g.fetch);
+
 // Workers draw with OffscreenCanvas (procedural textures, text atlases) and read the pixels back.
 g.OffscreenCanvas = OffscreenCanvasImpl;
+installConvertToBlob(); // convertToBlob writes real JPEG and PNG files (a JPEG encoder pool runs here)
 g.OffscreenCanvasRenderingContext2D = Context2D;
 g.Path2D = Path2DImpl;
 g.ImageData = ImageDataImpl;

@@ -1,6 +1,10 @@
+// First, so every module after it builds \p{...} patterns from strings through the wrapped RegExp (no ICU in Puerts).
+import './unicodeRegExp';
 import '../../JavaScript/LanguageBuiltins.mjs';
 import './intl';
 import {base64Bytes, bytesBase64} from './base64';
+import {installStructuredClone} from './structuredClone';
+import {installWebPlatform} from './webPlatform';
 export {base64Bytes, bytesBase64};
 
 /** Standard web APIs that Puerts' V8 (9.4, no Node, no browser) lacks. Each install is guarded,
@@ -9,22 +13,8 @@ const g = globalThis as Record<string, any>;
 
 g.window ??= g; g.self ??= g;
 
-if (!g.structuredClone) {
-  const clone = (v: any, seen: Map<any, any>): any => {
-    if (v === null || typeof v !== 'object') return v;
-    if (seen.has(v)) return seen.get(v);
-    if (v instanceof Date) return new Date(v.getTime());
-    if (v instanceof RegExp) return new RegExp(v.source, v.flags);
-    if (ArrayBuffer.isView(v)) return (v as any).slice();
-    if (v instanceof ArrayBuffer) return v.slice(0);
-    if (v instanceof Map) { const m = new Map(); seen.set(v, m); v.forEach((x, k) => m.set(clone(k, seen), clone(x, seen))); return m; }
-    if (v instanceof Set) { const s = new Set(); seen.set(v, s); v.forEach(x => s.add(clone(x, seen))); return s; }
-    const out: any = Array.isArray(v) ? [] : {}; seen.set(v, out);
-    for (const k of Object.keys(v)) out[k] = clone(v[k], seen);
-    return out;
-  };
-  g.structuredClone = (v: unknown) => clone(v, new Map());
-}
+// structuredClone as a browser does it (structuredClone.ts): IndexedDB clones every stored value with it.
+installStructuredClone();
 
 if (!g.TextEncoder) {
   g.TextEncoder = class { readonly encoding = 'utf-8';
@@ -202,11 +192,22 @@ g.crypto ??= {};
 // crypto has its own generator, so it never shifts a seeded Math.random sequence.
 let cryptoState = (Date.now() ^ 0x9e3779b9) >>> 0;
 const cryptoByte = () => { cryptoState ^= cryptoState << 13; cryptoState ^= cryptoState >>> 17; cryptoState ^= cryptoState << 5; return (cryptoState >>> 0) & 255; };
-g.crypto.getRandomValues ??= (a: ArrayBufferView) => { const b = new Uint8Array(a.buffer, a.byteOffset, a.byteLength); for (let i = 0; i < b.length; i++) b[i] = cryptoByte(); return a; };
+// A host with a secure generator (randomBytes: OpenSSL in Unreal, node:crypto in the smoke test) fills it: sign-in
+// libraries make their PKCE verifiers and state from it. Without one, the fast generator above stands in.
+// The page reaches it through __jsgbHost, a threaded worker through its own __randomBytes (JsgbWorkers.cpp).
+const hostRandom = (n: number): Uint8Array | null => { const b = g.__jsgbHost?.randomBytes?.(n) ?? g.__randomBytes?.(n); return b && b.byteLength === n ? new Uint8Array(b) : null; };
+g.crypto.getRandomValues ??= (a: ArrayBufferView) => {
+  const b = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+  if (b.length > 65536) throw new (g.DOMException ?? Error)('getRandomValues: more than 65536 bytes', 'QuotaExceededError');
+  const secure = b.length ? hostRandom(b.length) : null;
+  if (secure) b.set(secure); else for (let i = 0; i < b.length; i++) b[i] = cryptoByte();
+  return a;
+};
 g.crypto.randomUUID ??= () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = cryptoByte() & 15; return (c === 'x' ? r : r & 3 | 8).toString(16); });
 
 const nav = (g.navigator ??= {});
-try { Object.assign(nav, {userAgent: 'JsGameBridge-Unreal', language: 'en-US', languages: ['en-US'], hardwareConcurrency: 8, maxTouchPoints: 0, platform: 'Win32'}); } catch { /* read-only host navigator */ }
+// platform: the host's ("MacIntel" on a Mac), so a game picks ⌘ or Ctrl shortcuts as it does in that OS's browser.
+try { Object.assign(nav, {userAgent: 'JsGameBridge-Unreal', language: 'en-US', languages: ['en-US'], hardwareConcurrency: 8, maxTouchPoints: 0, platform: g.__jsgbHost?.platform || 'Win32'}); } catch { /* read-only host navigator */ }
 nav.getGamepads ??= () => [];
 nav.storage ??= {estimate: async () => ({usage: 0, quota: 1e10}), persist: async () => true};
 nav.clipboard ??= {writeText: async () => {}, readText: async () => ''};
@@ -285,3 +286,6 @@ if (g.AbortSignal) {
   define(g.AbortSignal, 'any', (signals: {aborted: boolean; addEventListener(t: string, f: () => void): void}[]) => { const c = new g.AbortController(); for (const s of signals) { if (s.aborted) c.abort(); else s.addEventListener('abort', () => c.abort()); } return c.signal; });
 }
 define(g, 'reportError', (e: unknown) => g.__jsgbHost?.log('error', 'reportError: ' + ((e as Error)?.stack ?? e)));
+
+// Streams, a streaming TextDecoder, URL fixes and the Cache API (webPlatform.ts), now that Blob, URL and TextEncoder exist.
+installWebPlatform();

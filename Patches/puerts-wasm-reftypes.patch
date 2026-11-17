@@ -1,0 +1,21 @@
+Puerts JsEnv on V8 9.4 (the Mac build, puerts-ue58-mac.patch): turn on WebAssembly reference types (externref) for
+the page's V8 before it starts. wasm-bindgen and newer Rust toolchains emit them by default, and V8 9.4 rejects such
+modules unless the flag is set (shipped from V8 9.6). The bridge's own worker isolates use a separate static copy of V8
+and set the same flag themselves (Source/JsGameBridge/Private/JsgbWasmFeatures.cpp).
+Apply from inside the Puerts folder, after puerts-ue58-mac.patch: git apply --ignore-whitespace <this file>
+
+--- a/Source/JsEnv/Private/JsEnvModule.cpp
++++ b/Source/JsEnv/Private/JsEnvModule.cpp
+@@ -215,6 +215,12 @@
+ 
+ #if defined(WITH_V8_BYTECODE)
+     v8::V8::SetFlagsFromString("--no-lazy --no-flush-bytecode --no-enable-lazy-source-positions");
++#endif
++
++#if V8_MAJOR_VERSION < 10
++    // WebAssembly reference types (externref), which wasm-bindgen and newer Rust toolchains emit by default: shipped in
++    // V8 9.6, complete behind this flag in 9.4. Without it such modules fail to compile (Spark's splat worker).
++    v8::V8::SetFlagsFromString("--experimental-wasm-reftypes");
+ #endif
+ 
+     // v8::V8::SetFlagsFromString("--expose-gc");

@@ -1,0 +1,28 @@
+{
+  "title": "PrepViz",
+  "repo": "../.worktrees/main-5180/apps/web",
+  "index": "index.html",
+  "public": [
+    "public"
+  ],
+  "platform": "browser",
+  "sceneFps": 60,
+  "origin": "http://localhost:5180",
+  "callbackPaths": [
+    "/auth/callback",
+    "/"
+  ],
+  "env": {
+    "VITE_API_BASE": "https://api.prepvis.com",
+    "VITE_AUTH0_DOMAIN": "auth.prechecklist.com",
+    "VITE_AUTH0_CLIENT_ID": "uxP1s35G36wpSpWMvygTQCB1Fx9mTsRT",
+    "VITE_AUTH0_AUDIENCE": "https://api.cineblocking.prechecklist.com"
+  },
+  "netAllow": [
+    "https://api.prepvis.com",
+    "https://auth.prechecklist.com",
+    "https://cdn.jsdelivr.net",
+    "https://overpass-api.de",
+    "https://nominatim.openstreetmap.org"
+  ]
+}

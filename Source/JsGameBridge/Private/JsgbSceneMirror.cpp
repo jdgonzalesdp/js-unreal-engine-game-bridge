@@ -6,6 +6,9 @@
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "JsgbBridge.h"
+#include "JsgbLines.h"
+#include "JsgbDrawOrder.h"
+#include "JsgbPostProcess.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/SkeletalMesh.h"
 #include "Components/PoseableMeshComponent.h"
@@ -1066,9 +1069,12 @@ void UJsgbSceneMirror::SetMaterial(int32 Id, const FString& Json)
 	// reversed culling, the back) unless the material is DoubleSide.
 	const bool bOneSided = Side != 2 && !bBillboard && (Variant == VMasked || Variant == VTrans || Variant == VUnlit || Variant == VUnlitTrans || Variant == VAdditive || Variant == VUnlitMasked);
 	const int32 VariantKey = Parent ? 1000 + (GetTypeHash(RegistryPath + CustomKey) + BlendMode * 7 + (Side == 2 ? 1 : 0)) % 100000 : Variant + (bOneSided ? 100 : 0);
-	if (!M.Instance || M.Variant != VariantKey)
+	// three draws a see-through surface with depthTest false or depthFunc Always over everything (JsgbDrawOrder.h).
+	const bool bThrough = Flag(J, TEXT("drawThrough")) && !Flag(J, TEXT("drawFirst"));
+	UMaterialInterface* Wanted = JsgbDrawOrder::DepthParent(Parent ? Parent : bOneSided ? OneSidedParent(Variant) : ParentFor(Variant), bThrough);
+	if (!M.Instance || M.Variant != VariantKey || M.Instance->Parent.Get() != Wanted)
 	{
-		M.Instance = UMaterialInstanceDynamic::Create(Parent ? Parent : bOneSided ? OneSidedParent(Variant) : ParentFor(Variant), this);
+		M.Instance = UMaterialInstanceDynamic::Create(Wanted, this);
 		M.Variant = VariantKey;
 		ApplySceneParams(M.Instance, VariantKey);
 	}
@@ -1080,6 +1086,7 @@ void UJsgbSceneMirror::SetMaterial(int32 Id, const FString& Json)
 	M.Size = Num(J, TEXT("size"), 1);
 	M.FatWidth = Num(J, TEXT("fatWidth"), 0);
 	M.bFatWorld = Flag(J, TEXT("fatWorld"));
+	M.bNoDepthTest = J->HasField(TEXT("depthTest")) && !Flag(J, TEXT("depthTest"));
 	M.bSizeAttenuation = !J->HasField(TEXT("sizeAttenuation")) || Flag(J, TEXT("sizeAttenuation"));
 	M.bVertexColors = Flag(J, TEXT("vertexColors"));
 	Mid->SetVectorParameterValue(TEXT("Color"), Color);
@@ -1529,7 +1536,11 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 			Camera->SetWorldLocationAndRotation(CameraFrom.GetLocation(), CameraFrom.Rotator());
 		}
 		else { Camera->SetWorldLocationAndRotation(CameraLocation, CameraRotation); }
-		if (D[20] > 0.5f) { Camera->SetProjectionMode(ECameraProjectionMode::Orthographic); Camera->SetOrthoWidth(D[21] * 2.f * Cm); /* the view keeps its vertical extent (Maintain Y FOV), so this is the visible height */ Camera->SetOrthoNearClipPlane(D[18] * Cm); Camera->SetOrthoFarClipPlane(D[19] * Cm); }
+		if (D[20] > 0.5f) { Camera->SetProjectionMode(ECameraProjectionMode::Orthographic); Camera->SetOrthoWidth(D[21] * 2.f * Cm); /* the view keeps its vertical extent (Maintain Y FOV), so this is the visible height */ Camera->SetOrthoNearClipPlane(D[18] * Cm); Camera->SetOrthoFarClipPlane(D[19] * Cm);
+			// The page's own near and far planes, and no plane correction: with Unreal's defaults an orthographic view
+			// is moved onto a line through the view target (this host actor at the origin), so a top view's pans and
+			// scrolls never moved the picture even though the camera did.
+			Camera->SetAutoCalculateOrthoPlanes(false); Camera->SetUpdateOrthoPlanes(false); }
 		else { Camera->SetProjectionMode(ECameraProjectionMode::Perspective); Camera->SetFieldOfView(CameraHFov); }
 		ApplyPost(D);
 	}
@@ -1563,12 +1574,21 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 		const bool bNoFog = First && First->bNoFog;
 		if (C->bRenderCustomDepth != bNoFog) { C->SetRenderCustomDepth(bNoFog); C->SetCustomDepthStencilValue(bNoFog ? 1 : 0); }
 		// A surface drawn first without depth (a sky dome) sorts behind every other translucent surface.
-		const int32 Priority = First && First->bDrawFirst ? -1000 : 0;
+		const int32 Priority = JsgbDrawOrder::Priority(this, Ent.Id, First && First->bDrawFirst ? -1000 : 0); // three's draw order
 		if (C->TranslucencySortPriority != Priority) { C->SetTranslucentSortPriority(Priority); }
 		if (UStaticMeshComponent* Sm = Cast<UStaticMeshComponent>(C))
 		{
 			const bool bBack = First && First->Side == 1;
 			if (Sm->bReverseCulling != bBack) { Sm->bReverseCulling = bBack; Sm->MarkRenderStateDirty(); }
+			// A plain mesh whose generated material moves its vertices is culled by bounds it no longer fills, like the
+			// instanced ones below: drei's Grid is an upright plane laid flat by its shader, and vanished whenever the camera
+			// looked away from that upright plane. Such a mesh never culls.
+			UStaticMesh* Geometry = First && First->bMovesVertices ? Sm->GetStaticMesh() : nullptr;
+			if (Geometry && Geometry->GetPositiveBoundsExtension().IsNearlyZero())
+			{
+				Geometry->SetPositiveBoundsExtension(FVector(1.0e6)); Geometry->SetNegativeBoundsExtension(FVector(1.0e6)); Geometry->CalculateExtendedBounds();
+				Sm->UpdateBounds(); Sm->MarkRenderStateDirty();
+			}
 		}
 		// An object of a render target's scene is drawn only by that target's scene capture, and only that
 		// scene's lights reach it (lighting channel 1).
@@ -1848,8 +1868,8 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 					const FVector B = W.TransformPosition(FVector(BP[0] * Cm, BP[2] * Cm, BP[1] * Cm));
 					// Unreal's batched lines put their colour on screen as it is, so it goes in sRGB-encoded.
 					const FColor Encoded = (Base * (MatInfo && MatInfo->bVertexColors ? G->LineColors[I] : FLinearColor::White)).ToFColor(true);
-					const FLinearColor C(Encoded.R / 255.f, Encoded.G / 255.f, Encoded.B / 255.f, Alpha);
-					Batch.Emplace(A, B, C, 0.f, 0.f, SDPG_World);
+					const bool bOnTop = MatInfo && MatInfo->bNoDepthTest;
+					Batch.Emplace(A, B, JsgbLines::Color(Encoded, Alpha, bOnTop), 0.f, 0.f, bOnTop ? SDPG_Foreground : SDPG_World);
 				}
 			}
 			Ent.Seen = Stamp;
@@ -1983,15 +2003,14 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 	const double LinesStart = FPlatformTime::Seconds();
 	FrameLines.Sort([](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key != B.Key ? A.Key > B.Key : A.Value < B.Value; });
 	{
-		// Unreal's translucent lines still depth-test each other, so a line drawn on top of an equal one
-		// loses wherever the depths tie. Each later line moves toward the camera along its own view
-		// rays by a tiny step: its pixels stay put, and it wins ties as it would in three.js.
-		// Unreal draws zero-width batched lines opaque, ignoring alpha; lines with a width are
-		// alpha-blended quads. Each line gets the world width of one screen pixel at its distance,
-		// so it looks like a WebGL line and blends with its material opacity.
+		// Unreal draws zero-width batched lines opaque, ignoring alpha; lines with a width are alpha-blended
+		// quads, so each line gets the world width of its pixels (JsgbLines.cpp places them).
 		const bool bOrtho = D[20] > 0.5f;
-		const double PixelPerCm = bOrtho ? 2.0 * D[21] * Cm / FMath::Max(1, ViewportSize.Y) : 2.0 * TanHalf / FMath::Max(1, ViewportSize.Y);
-		FString Order = FString::Printf(TEXT("%.1f,%.1f,%.1f,%d|"), CameraLocation.X, CameraLocation.Y, CameraLocation.Z, ViewportSize.Y);
+		// A CSS pixel, the unit of the page's line widths: PixelScale device pixels on a Retina Mac.
+		const double CssHeight = FMath::Max(1.0, ViewportSize.Y / double(FMath::Max(1.f, PixelScale)));
+		const double PixelPerCm = bOrtho ? 2.0 * D[21] * Cm / CssHeight : 2.0 * TanHalf / CssHeight;
+		// Line widths follow view depth and the part of each line in frame, so the key holds the view direction and frame size.
+		FString Order = FString::Printf(TEXT("%.1f,%.1f,%.1f,%dx%d,%g,%s|"), CameraLocation.X, CameraLocation.Y, CameraLocation.Z, ViewportSize.X, ViewportSize.Y, PixelPerCm, *Forward.ToString());
 		for (const TPair<double, int32>& P : FrameLines) { const FJsgbEntity* LineEnt = Entities.Find(P.Value); Order += FString::Printf(TEXT("%d:%u:%g,"), P.Value, LineEnt ? LineEnt->LineSignature : 0u, LineEnt ? LineEnt->LineWidth : 1.f); }
 		if (Order != SharedLinesOrder)
 		{
@@ -2004,19 +2023,14 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 			}
 			SharedLines->Flush();
 			TArray<FBatchedLine> All;
+			const FJsgbLineView LineView{CameraLocation, Forward.GetSafeNormal(), bOrtho, PixelPerCm, FVector2D(ViewportSize) / FMath::Max(1.f, PixelScale)};
 			int32 Rank = 0;
 			for (const TPair<double, int32>& P : FrameLines)
 			{
 				const FJsgbEntity* LineEnt = Entities.Find(P.Value);
 				if (!LineEnt) { continue; }
-				const double Step = 2e-5 * ++Rank;
-				for (FBatchedLine L : LineEnt->Lines)
-				{
-					L.Start += (CameraLocation - L.Start) * Step;
-					L.End += (CameraLocation - L.End) * Step;
-					L.Thickness = LineEnt->bLineWorld ? LineEnt->LineWidth * Cm : LineEnt->LineWidth * (bOrtho ? PixelPerCm : PixelPerCm * FVector::Dist(CameraLocation, (L.Start + L.End) * 0.5));
-					All.Add(L);
-				}
+				++Rank;
+				for (const FBatchedLine& L : LineEnt->Lines) { JsgbLines::Add(All, L, LineView, LineEnt->LineWidth, LineEnt->bLineWorld, Rank); }
 			}
 			if (All.Num()) { SharedLines->DrawLines(All); }
 			LineSegmentsDrawn = All.Num();
@@ -2094,7 +2108,11 @@ void UJsgbSceneMirror::ApplyEvents(const FString& Json)
 		if (!E) { continue; }
 		const FString Kind = Str(E, TEXT("kind"));
 		if (Kind == TEXT("key")) { KeyNames.Add(static_cast<int32>(Num(E, TEXT("id"))), Str(E, TEXT("key"))); continue; }
+		// The page's post-processing chain as post-process materials (JsgbPostProcess.cpp).
+		if (Kind.StartsWith(TEXT("post"))) { JsgbPostProcess::Apply(this, Kind, E); continue; }
 		// A skeletal swap entity's material variant (JsgbSkeletal.cpp), "" for the asset's own materials.
+		// three's draw order as a translucency sort priority (JsgbDrawOrder.h).
+		if (Kind == TEXT("order")) { JsgbDrawOrder::Note(this, static_cast<int32>(Num(E, TEXT("id"))), static_cast<int32>(Num(E, TEXT("priority")))); continue; }
 		if (Kind == TEXT("variant")) { const int32 Id = static_cast<int32>(Num(E, TEXT("id"))); const FString Variant = Str(E, TEXT("variant")); if (Variant.IsEmpty()) { EntityVariants.Remove(Id); } else { EntityVariants.Add(Id, Variant); } continue; }
 		// Skeletal swaps: the joint, morph target and material slot names an asset's records index (JsgbSkeletal.cpp).
 		if (Kind == TEXT("skeleton"))
@@ -2183,6 +2201,14 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 		// A shader captured in an earlier run already has its asset (the key is a hash of the shader), unless the scene
 		// parameter collection changed since: the asset's references to it no longer resolve and it wouldn't compile in a
 		// cook, so it's saved again.
+		// A shader that moves its vertices (a world position offset) and whose fragment stage reads `position`.
+		const bool bPlaced = !Str(S, TEXT("vertexHlsl")).IsEmpty();
+		bool bPixelReadsPosition = false;
+		const TArray<TSharedPtr<FJsonValue>>* PixelInputs = nullptr;
+		if (bPlaced && S->TryGetArrayField(TEXT("inputs"), PixelInputs))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *PixelInputs) { bPixelReadsPosition |= Str(V->AsObject(), TEXT("source")) == TEXT("localPosition"); }
+		}
 		bool bCaptured = bSave && FPaths::FileExists(FPackageName::LongPackageNameToFilename(PackagePath, FPackageName::GetAssetPackageExtension()));
 		if (bCaptured)
 		{
@@ -2202,6 +2228,13 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 					for (UMaterialExpression* E : Old->GetExpressions()) { const UMaterialExpressionVectorParameter* V = Cast<UMaterialExpressionVectorParameter>(E); bEnv |= V && V->ParameterName == TEXT("EnvLight"); }
 					bStale = !bEnv;
 				}
+				// So is a moved shader saved while its fragment stage still read the position after the offset.
+				if (!bStale && bPixelReadsPosition)
+				{
+					bool bExcludes = false;
+					for (UMaterialExpression* E : Old->GetExpressions()) { const UMaterialExpressionLocalPosition* L = Cast<UMaterialExpressionLocalPosition>(E); bExcludes |= L && L->IncludedOffsets == EPositionIncludedOffsets::ExcludeOffsets; }
+					bStale = !bExcludes;
+				}
 			}
 			if (bStale)
 			{
@@ -2217,13 +2250,24 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 		UPackage* Package = bSave && !bCaptured ? CreatePackage(*PackagePath) : nullptr;
 		UMaterial* Mat = Package ? NewObject<UMaterial>(Package, *AssetName, RF_Public | RF_Standalone) : NewObject<UMaterial>(this, NAME_None, RF_Transient);
 		Mat->MaterialDomain = MD_Surface;
-		Mat->BlendMode = Blend == 2 ? BLEND_Additive : Blend == 1 ? BLEND_Translucent : BLEND_Opaque;
+		// An opaque shader that discards pixels is masked: Unreal's depth pass skips an opaque material's pixel stage, so it
+		// would write depth where three.js discarded (the splat stand-ins' stochastic transparency, splatShader.ts).
+		const bool bDiscards = Blend == 0 && Str(S, TEXT("hlsl")).Contains(TEXT("discard;"));
+		Mat->BlendMode = Blend == 2 ? BLEND_Additive : Blend == 1 ? BLEND_Translucent : bDiscards ? BLEND_Masked : BLEND_Opaque;
 		Mat->TwoSided = bTwoSided;
 		Mat->SetShadingModel(MSM_Unlit);
 		Mat->bUsedWithInstancedStaticMeshes = true;
 		Mat->bUsedWithNiagaraSprites = false;
 		auto Add = [Mat](UMaterialExpression* E) { Mat->GetExpressionCollection().AddExpression(E); return E; };
 		const bool bInstancedShader = Flag(S, TEXT("instanced"));
+		// The pixel position without the offset is interpolated only while analytic derivatives are on (the default); with
+		// them off Unreal hands the pixel stage zero.
+		static bool bWarnedDeriv = false;
+		if (bPixelReadsPosition && !bWarnedDeriv)
+		{
+			const IConsoleVariable* Deriv = IConsoleManager::Get().FindConsoleVariable(TEXT("r.MaterialEditor.AnalyticDeriv"));
+			if (Deriv && Deriv->GetInt() == 0) { bWarnedDeriv = true; UE_LOG(LogJsgbMirror, Warning, TEXT("r.MaterialEditor.AnalyticDeriv is 0: shaders that move their vertices read a zero position per pixel")); }
+		}
 		// One Custom node per stage; its inputs are the node graph the translated HLSL reads.
 		auto MakeCustom = [&](const FString& Code, const TCHAR* InputsField, ECustomMaterialOutputType Output) -> UMaterialExpressionCustom*
 		{
@@ -2240,7 +2284,15 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 			const FString Source = Str(In, TEXT("source")), Param = Str(In, TEXT("param"));
 			const int32 Index = static_cast<int32>(Num(In, TEXT("index")));
 			UMaterialExpression* E = nullptr;
-			if (Source == TEXT("localPosition")) { E = NewObject<UMaterialExpressionLocalPosition>(Mat); }
+			if (Source == TEXT("localPosition"))
+			{
+				UMaterialExpressionLocalPosition* L = NewObject<UMaterialExpressionLocalPosition>(Mat);
+				// The fragment stage replays the vertex stage on `position`, the vertex attribute in three.js. By default a
+				// pixel's local position includes the offset this same material applies, so a moved shader was moved twice
+				// (drei's Grid lays its upright plane flat: one family of its lines vanished and the rest flickered).
+				if (bPlaced && FCString::Strcmp(InputsField, TEXT("inputs")) == 0) { L->IncludedOffsets = EPositionIncludedOffsets::ExcludeOffsets; }
+				E = L;
+			}
 			else if (Source == TEXT("worldPosition")) { E = NewObject<UMaterialExpressionWorldPosition>(Mat); }
 			else if (Source == TEXT("localAxis"))
 			{
@@ -2321,7 +2373,7 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 			}
 			Add(E);
 			// Vector parameters put RGBA on output 5; vertex colour has no RGBA output, so append A to RGB.
-			int32 Output = Cast<UMaterialExpressionVectorParameter>(E) ? 5 : 0;
+			int32 OutputIndex = Cast<UMaterialExpressionVectorParameter>(E) ? 5 : 0;
 			if (Source == TEXT("vertexColor"))
 			{
 				// The mesh stores colours sRGB-encoded; three.js shaders read them linear.
@@ -2329,11 +2381,11 @@ UMaterialInterface* UJsgbSceneMirror::GeneratedParent(const FString& Key, int32 
 				Linear->Base.Connect(0, E); Linear->ConstExponent = 2.2f; Add(Linear);
 				UMaterialExpressionAppendVector* Rgba = NewObject<UMaterialExpressionAppendVector>(Mat);
 				Rgba->A.Connect(0, Linear); Rgba->B.Connect(4, E);
-				E = Add(Rgba); Output = 0;
+				E = Add(Rgba); OutputIndex = 0;
 			}
 			FCustomInput CI;
 			CI.InputName = *Str(In, TEXT("name"));
-			CI.Input.Connect(Output, E);
+			CI.Input.Connect(OutputIndex, E);
 			Custom->Inputs.Add(CI);
 		}
 		Add(Custom);
@@ -2588,4 +2640,5 @@ void UJsgbSceneMirror::ResetAll()
 	for (TPair<int32, FJsgbEntity>& E : Entities) { if (E.Value.Component) { E.Value.Component->DestroyComponent(); } if (E.Value.Effect) { E.Value.Effect->DestroyComponent(); } }
 	for (TPair<int32, FJsgbLight>& L : Lights) { if (L.Value.Component) { L.Value.Component->DestroyComponent(); } }
 	Entities.Reset(); Lights.Reset(); Geometries.Reset(); Materials.Reset(); Textures.Reset(); BuildQueue.Reset(); KeyNames.Reset();
+	JsgbDrawOrder::Reset(this);
 }

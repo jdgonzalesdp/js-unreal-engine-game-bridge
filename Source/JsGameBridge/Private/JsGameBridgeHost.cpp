@@ -106,11 +106,11 @@ bool UJsGameBridgeHost::StartReloadServer(){
     IFileManager::Get().MakeDirectory(*Directory,true);const FString Output=Directory/(Name+TEXT(".png"));FScreenshotRequest::RequestScreenshot(Output,true,false);
     auto Receipt=MakeShared<FJsonObject>();Receipt->SetStringField(TEXT("path"),Output);FString Text;FJsonSerializer::Serialize(Receipt,TJsonWriterFactory<>::Create(&Text));Complete(FHttpServerResponse::Create(Text,TEXT("application/json")));return true;
    }
-   if(Route==TEXT("/bridge/close")){Complete(FHttpServerResponse::Create(TEXT("{\"closing\":true}"),TEXT("application/json")));FPlatformMisc::RequestExit(false);return true;}
+   if(Route==TEXT("/bridge/close")){Complete(FHttpServerResponse::Create(FString(TEXT("{\"closing\":true}")),TEXT("application/json")));FPlatformMisc::RequestExit(false);return true;}
    if(Request.Body.Num()>65536||!Weak->bReady){Complete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest));return true;}
    FString Input=FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Request.Body.GetData()),Request.Body.Num()));TSharedPtr<FJsonObject> ParsedInput;
    if(!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Input),ParsedInput)||!ParsedInput){Complete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest));return true;}
-   Weak->SendInput(Input);Complete(FHttpServerResponse::Create(TEXT("{\"accepted\":true}"),TEXT("application/json")));return true;
+   Weak->SendInput(Input);Complete(FHttpServerResponse::Create(FString(TEXT("{\"accepted\":true}")),TEXT("application/json")));return true;
   }
   if(Request.FullPath.GetPath()==TEXT("/bridge/status")&&Request.Verb==EHttpServerRequestVerbs::VERB_GET&&Weak.IsValid()){
    auto Receipt=MakeShared<FJsonObject>();Receipt->SetStringField(TEXT("sourceCommit"),Weak->SourceCommit);Receipt->SetStringField(TEXT("bundleSHA256"),Weak->BundleSHA256);Receipt->SetBoolField(TEXT("ready"),Weak->bReady);Receipt->SetNumberField(TEXT("bootGeneration"),Weak->BootGeneration);Receipt->SetNumberField(TEXT("sceneFrames"),Weak->SceneFrames);Receipt->SetNumberField(TEXT("uiLayoutMessages"),Weak->UILayoutMessages);FString Text;FJsonSerializer::Serialize(Receipt,TJsonWriterFactory<>::Create(&Text));Complete(FHttpServerResponse::Create(Text,TEXT("application/json")));return true;

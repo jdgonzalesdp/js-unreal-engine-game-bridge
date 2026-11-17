@@ -14,6 +14,10 @@ import {createHash} from 'node:crypto';
 import {execFileSync, spawnSync} from 'node:child_process';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {workerMainSource, workerScript} from './worker-main.mjs';
+import {unicodeRegexPlugin, rewriteUnicodePropertyRegexes} from './unicode-regex.mjs';
+import {injectUnicodeProperties} from './unicode-props.mjs';
+import {viteAssets, rebaseCssUrls} from './vite-assets.mjs';
+import {sceneFps} from './game-frame-rate.mjs';
 
 const bridge = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtime = path.join(bridge, 'Runtime');
@@ -103,7 +107,7 @@ function readPage(game) {
     if (!/rel="stylesheet"/.test(m[1])) continue;
     const href = /href="([^"]+)"/.exec(m[1])?.[1]; if (!href || /^https?:/.test(href)) continue;
     const file = [path.join(game.repo, href), ...game.publicRoots.map(r => path.join(r, href))].find(f => fs.existsSync(f));
-    if (file) css.push({file, text: fs.readFileSync(file, 'utf8')});
+    if (file) css.push({file, text: rebaseCssUrls(fs.readFileSync(file, 'utf8'), href)});
   }
   for (const m of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) css.push({file: null, text: m[1]});
   if (!entry && !game.entryOverride && !inlineModules.length) throw Error('the page has no <script type="module">');
@@ -121,7 +125,7 @@ function threeFiles(game) {
 }
 
 /** esbuild plugin: the browser-build conventions (Vite's) that games rely on, plus the three alias. */
-function bridgePlugin(game, page) {
+function bridgePlugin(game, page, {worker = false} = {}) {
   const three = threeFiles(game);
   const src = path.join(runtime, 'src');
   return {
@@ -143,7 +147,9 @@ function bridgePlugin(game, page) {
         resolveDir: path.dirname(a.path), loader: 'js',
       }));
       // 'three' is the real library with WebGLRenderer replaced; the runtime reaches the real one as 'three-real'.
-      b.onResolve({filter: /^three$/}, a => a.importer === path.join(src, 'three.ts') ? {path: three.core} : {path: path.join(src, 'three.ts')});
+      // A worker thread can't render and has no host, so its own bundle takes the real library (a mesh import's pick
+      // tree, built off the main thread, only does maths with it).
+      b.onResolve({filter: /^three$/}, a => worker || a.importer === path.join(src, 'three.ts') ? {path: three.core} : {path: path.join(src, 'three.ts')});
       b.onResolve({filter: /^three-real$/}, () => ({path: three.core}));
       b.onResolve({filter: /^three\/webgpu$/}, () => ({path: 'three/webgpu', namespace: 'jsgb-three-webgpu'}));
       b.onLoad({filter: /.*/, namespace: 'jsgb-three-webgpu'}, () => ({resolveDir: src, loader: 'js',
@@ -163,7 +169,7 @@ function bridgePlugin(game, page) {
       // Vite query suffixes.
       b.onResolve({filter: /\?(raw|url|inline|worker|sharedworker)$/}, a => {
         const [file, query] = a.path.split('?');
-        return {path: path.resolve(a.resolveDir, file), namespace: 'jsgb-' + (query === 'sharedworker' ? 'worker' : query), pluginData: a.resolveDir};
+        return {path: queryFile(file, a.resolveDir), namespace: 'jsgb-' + (query === 'sharedworker' ? 'worker' : query), pluginData: a.resolveDir};
       });
       b.onLoad({filter: /.*/, namespace: 'jsgb-raw'}, a => ({contents: fs.readFileSync(a.path, 'utf8'), loader: 'text'}));
       b.onLoad({filter: /.*/, namespace: 'jsgb-inline'}, a => ({contents: fs.readFileSync(a.path, 'utf8'), loader: 'text'}));
@@ -184,6 +190,18 @@ import {gltfLoaded as __jsgbGltfLoaded} from ${JSON.stringify(path.join(src, 'ov
   };
 }
 `}));
+      // troika-three-text (drei's <Text>) copies glyphs into its atlas canvas with WebGL, even on its JavaScript path.
+      // A canvas without WebGL takes the 2D copies in Runtime/src/sdfCanvas.ts (the source is also sent to workers as
+      // text, so the hook is a global, not an import).
+      b.onLoad({filter: /[\\/]webgl-sdf-generator[\\/]dist[\\/]webgl-sdf-generator\.mjs$/}, async a => {
+        const gl2d = name => `function ${name}(c) { const s = globalThis.__jsgbSdf2D; if (s && c && typeof c.getContext === 'function' && !c.getContext('webgl')) `;
+        const code = (await fs.promises.readFile(a.path, 'utf8'))
+          .replace('function renderImageData(', `${gl2d('renderImageData')}return s.renderImageData.apply(null, arguments); return renderImageData__gl.apply(this, arguments); }\n  function renderImageData__gl(`)
+          .replace('function resizeWebGLCanvasWithoutClearing(', `${gl2d('resizeWebGLCanvasWithoutClearing')}return s.resizeCanvas.apply(null, arguments); return resizeWebGLCanvasWithoutClearing__gl.apply(this, arguments); }\n  function resizeWebGLCanvasWithoutClearing__gl(`);
+        return {resolveDir: path.dirname(a.path), loader: 'js', contents: code};
+      });
+      // Vite's asset URLs (new URL(..., import.meta.url)) and import.meta.glob, also in dependencies: Tools/vite-assets.mjs.
+      const viteUrls = viteAssets(b, game);
       // Workers: each worker module becomes a function of its own `self`, sharing the main bundle's modules.
       b.onLoad({filter: /\.(m?[jt]sx?)$/}, async a => {
         if (a.path.includes('node_modules') || a.namespace !== 'file') return undefined;
@@ -198,10 +216,15 @@ import {gltfLoaded as __jsgbGltfLoaded} from ${JSON.stringify(path.join(src, 'ov
           });
           if (imports.length) { code = imports.join('\n') + '\n' + code; changed = true; }
         }
+        if (code.includes('import.meta')) { const v = viteUrls(code, a.path); if (v !== code) { code = v; changed = true; } }
         if (code.includes('import.meta.glob')) { code = expandGlobs(code, path.dirname(a.path)); changed = true; }
+        // Unicode property escapes in regex literals become code point ranges (Puerts' V8 has no ICU): Tools/unicode-regex.mjs.
+        const props = rewriteUnicodePropertyRegexes(code);
+        if (props.count) { code = props.code; changed = true; }
         if (code.includes('import.meta.url')) { code = code.replaceAll('import.meta.url', JSON.stringify('http://localhost/' + path.relative(game.repo, a.path).replaceAll('\\', '/'))); changed = true; }
         return changed ? {contents: code, loader: path.extname(a.path).slice(1).replace('mjs', 'js').replace('cjs', 'js')} : undefined;
       });
+      unicodeRegexPlugin(b, fs);
       b.onResolve({filter: /^jsgb-worker-main:/}, a => ({path: a.path.slice('jsgb-worker-main:'.length), namespace: 'jsgb-worker-main'}));
       b.onLoad({filter: /.*/, namespace: 'jsgb-worker-main'}, async a => {
         const code = await workerScript(b.esbuild, await fs.promises.readFile(a.path, 'utf8'), a.path);
@@ -216,13 +239,24 @@ import {gltfLoaded as __jsgbGltfLoaded} from ${JSON.stringify(path.join(src, 'ov
 
 /** Worker modules the main build met, and the URL of each one's standalone bundle. */
 const workerEntries = new Map();
+// The file of a Vite query import. A package path ("lcms-wasm/dist/lcms.wasm?url") is looked up in node_modules from
+// the importing folder upward, as Vite does; anything else is relative to the importer.
+function queryFile(file, dir) {
+  if (file.startsWith('.') || path.isAbsolute(file)) return path.resolve(dir, file);
+  for (let d = dir; ; d = path.dirname(d)) {
+    const candidate = path.join(d, 'node_modules', file);
+    if (fs.existsSync(candidate)) return candidate;
+    if (path.dirname(d) === d) return path.resolve(dir, file);
+  }
+}
+
 const workerUrl = (game, file) => '/jsgb/workers/' + path.relative(game.repo, file).replace(/[\\/:]+/g, '_').replace(/\.(m?[jt]sx?)$/, '') + '.js';
 
 /** Bundles each worker module as a classic script for a worker thread. */
 async function workerBundles(esbuild, game, page, options) {
   for (const [file, url] of workerEntries) {
     const outfile = path.join(game.out, url.slice(1));
-    await esbuild.build({...options, entryPoints: [file], format: 'iife', splitting: false, metafile: false, outfile, plugins: [bridgePlugin(game, page)]});
+    await esbuild.build({...options, entryPoints: [file], format: 'iife', splitting: false, metafile: false, outfile, plugins: [bridgePlugin(game, page, {worker: true})]});
     // A worker thread has no __jsgbHost: a runtime module that imports host.ts throws there before the worker starts.
     if (fs.readFileSync(outfile, 'utf8').includes('__jsgbHost is missing')) throw Error(`worker bundle ${url} includes Runtime/src/host.ts; a module the worker imports (three.ts, renderer.ts) must not import the host`);
   }
@@ -316,13 +350,13 @@ export async function build(game) {
   const pageInfo = {title: page.title, lang: page.lang, htmlAttrs: page.htmlAttrs, bodyAttrs: page.bodyAttrs, body: page.body};
   // Settings shared by the game bundle and the standalone worker bundles.
   const common = {
-    bundle: true, target: game.target ?? 'es2022', platform: 'neutral',
+    bundle: true, target: game.target ?? 'es2022', platform: game.platform ?? 'neutral',
     mainFields: ['browser', 'module', 'main'], conditions: ['browser', 'import', 'module', 'default'],
     absWorkingDir: game.repo, nodePaths: [path.join(game.repo, 'node_modules'), path.join(runtime, 'node_modules')],
     define: {
       'import.meta.env': JSON.stringify({DEV: false, PROD: true, SSR: false, MODE: 'production', BASE_URL: '/', UNREAL: true, ...(game.env ?? {})}),
       __JSGB_WEBGL_MODULE_DRAWS__: String(await webglModuleDraws(esbuild, threeFiles(game).core)),
-      __JSGB_SHADER_VERSION__: JSON.stringify(sha256(Buffer.concat(['src/shaders.ts', 'src/shaderWorker.ts', 'src/shaderWorkerHost.ts', 'vendor/cross-shader/CrossShader.cjs', 'vendor/cross-shader/CrossShader.wasm'].map(f => fs.readFileSync(path.join(runtime, f))))).slice(0, 12)),
+      __JSGB_SHADER_VERSION__: JSON.stringify(sha256(Buffer.concat(['src/shaders.ts', 'src/attributes.ts', 'src/shaderWorker.ts', 'src/shaderWorkerHost.ts', 'vendor/cross-shader/CrossShader.cjs', 'vendor/cross-shader/CrossShader.wasm'].map(f => fs.readFileSync(path.join(runtime, f))))).slice(0, 12)),
       'process.env.NODE_ENV': '"production"', 'import.meta.hot': 'undefined', 'import.meta.url': '"http://localhost/index.js"', __JSGB_PAGE__: JSON.stringify(pageInfo), __JSGB_INLINE__: JSON.stringify(page.inline), ...(game.define ?? {}),
     },
     loader: {'.json': 'json', '.css': 'css', '.glsl': 'text', '.vert': 'text', '.frag': 'text', '.wgsl': 'text', '.txt': 'text',
@@ -336,6 +370,8 @@ export async function build(game) {
   const result = await esbuild.build({...common, entryPoints: {[game.id]: path.join(runtime, 'src/entry.ts')}, outdir: game.out, outExtension: {'.js': '.mjs'},
     format: 'esm', splitting: false, metafile: true, plugins: [bridgePlugin(game, page)]});
   await workerBundles(esbuild, game, page, common);
+  // The Unicode properties the bundles build patterns from at run time (Tools/unicode-props.mjs, Runtime/src/unicodeRegExp.ts).
+  injectUnicodeProperties([path.join(game.out, game.id + '.mjs'), ...[...workerEntries.values()].map(url => path.join(game.out, url.slice(1)))]);
   // Runtime files the bundle reads at run time (the shader compiler, and the runtime inside threaded Web Workers).
   fs.mkdirSync(path.join(game.out, 'jsgb'), {recursive: true});
   await esbuild.build({entryPoints: [path.join(runtime, 'src/workerRuntime.ts')], bundle: true, format: 'iife', target: 'es2020', platform: 'neutral',
@@ -371,7 +407,9 @@ export async function build(game) {
   // host without the bridge's CEF build) fetches the overlay URL from the host's server instead of using the string,
   // and the server then found the game's source index.html last in the public roots: its module script failed on
   // "three" and the game's error handler covered the screen with its startup failure card. The out folder comes first.
-  const client = fs.readFileSync(path.join(bridge, 'JavaScript/jsgb-ui-client.js'), 'utf8');
+  // The client, then every other JavaScript/jsgb-ui-*.js in name order (editing, scrolling), as the host appends them.
+  const uiScripts = ['jsgb-ui-client.js', ...fs.readdirSync(path.join(bridge, 'JavaScript')).filter(f => /^jsgb-ui-.+\.js$/.test(f) && f !== 'jsgb-ui-client.js').sort()];
+  const client = uiScripts.map(f => fs.readFileSync(path.join(bridge, 'JavaScript', f), 'utf8')).join('\n');
   fs.writeFileSync(path.join(game.out, 'index.html'), `<!doctype html><html><head><meta charset='utf-8'><title>${page.title ?? ''}</title><style id='jsgb-page-css'>${allCss}` +
     `</style><style>html,body{background:transparent!important;overflow:hidden!important}::-webkit-scrollbar{display:none}canvas:not([data-jsgb-pixels]){background:transparent!important;opacity:0!important}</style><script>${client}</script></head><body></body></html>`);
   const bundlePath = path.join(game.out, game.id + '.mjs');
@@ -392,9 +430,14 @@ export async function build(game) {
   if (game.overrides) fs.copyFileSync(path.resolve(bridge, game.overrides), overridesOut);
   else if (fs.existsSync(overridesOut)) fs.rmSync(overridesOut);
   fs.writeFileSync(path.join(game.out, 'registry.json'), JSON.stringify({version: 1, assets, materials, files, swaps: {assets: !!game.swaps?.assets, effects: !!game.swaps?.effects}}));
-  const publication = {version: 1, game: game.id, sourceCommit: commit || '0'.repeat(40), sourceDirty: !!git(game.repo, 'status', '--porcelain', '--untracked-files=no'),
+  // netAllow: the origins the host lets the game's fetch() reach (Source/JsGameBridge/Private/JsgbNet.cpp).
+  const publication = {version: 1, game: game.id, netAllow: game.netAllow ?? [], sourceCommit: commit || '0'.repeat(40), sourceDirty: !!git(game.repo, 'status', '--porcelain', '--untracked-files=no'),
     bridgeCommit: git(bridge, 'rev-parse', 'HEAD'), bundle: bundlePath, bundleSHA256: sha256(bundle), modules: Object.keys(result.metafile.inputs).length,
-    bytes: bundle.length, buildMilliseconds: Math.round(performance.now() - started), publicRoots: game.publicRoots, search: game.search ?? '', title: page.title};
+    bytes: bundle.length, buildMilliseconds: Math.round(performance.now() - started), publicRoots: game.publicRoots, search: game.search ?? '', title: page.title,
+    // The page's address and its sign-in returns (Source/JsGameBridge/Private/JsgbAddress.cpp, Runtime/src/location.ts).
+    origin: game.origin ?? '', callbackPaths: game.callbackPaths ?? [], gameTitle: game.title ?? page.title,
+    // The default frame cap of the mirrored scene (Tools/game-frame-rate.mjs, Source/JsGameBridge/Private/JsgbFrameCap.h).
+    sceneFps: sceneFps(game)};
   fs.writeFileSync(path.join(game.out, 'publication.json'), JSON.stringify(publication, null, 1));
   console.log(`built ${game.id}: ${publication.modules} modules, ${(bundle.length / 1e6).toFixed(1)} MB, ${publication.buildMilliseconds} ms -> ${bundlePath}`);
   return publication;

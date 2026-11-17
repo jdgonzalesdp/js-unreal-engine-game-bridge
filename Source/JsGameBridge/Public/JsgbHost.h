@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "GameFramework/GameModeBase.h"
 #include "Engine/Scene.h"
+#include "GenericPlatform/ICursor.h"
 #include "PuertsNamespaceDef.h"
 #include "JsgbHost.generated.h"
 
@@ -54,6 +55,9 @@ public:
 	/** The page CSS version the overlay last painted (POST /bridge/css). */
 	int32 AppliedCssVersion = -1;
 	FString LastLayoutSize;
+	/** The page's cursor under the mouse (host-cursor packets, JsgbCursor.h); unset until the page sent one. */
+	TOptional<EMouseCursor::Type> PageCursor;
+	bool bPageCursorChanged = false;
 };
 
 /** One timed step of a host script (-JsgbScript=file): "<seconds|@frame> <verb> <args>". */

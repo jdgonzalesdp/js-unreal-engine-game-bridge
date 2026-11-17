@@ -4,7 +4,7 @@ import {frameCount} from './frameCount';
 
 /** Timers and animation frames driven by the host's tick, so the game advances only when Unreal
  *  steps it. `pumpFrame` runs everything that is due, yielding to promise jobs between batches. */
-type Timer = {id: number; due: number; fn: (...a: unknown[]) => void; args: unknown[]; every: number};
+type Timer = {id: number; due: number; fn: (...a: unknown[]) => void; args: unknown[]; every: number; immediate?: boolean};
 const timers = new Map<number, Timer>();
 let nextId = 1;
 let frameCallbacks: Array<[number, FrameRequestCallback]> = [];
@@ -30,7 +30,12 @@ g.setInterval = (fn: (...a: unknown[]) => void, ms = 0, ...args: unknown[]) => {
   const id = nextId++, every = Math.max(1, +ms || 0); timers.set(id, {id, due: host.now() + every, fn, args, every}); return id;
 };
 g.clearTimeout = g.clearInterval = (id: number) => { timers.delete(id); };
-g.setImmediate = (fn: () => void) => (g.setTimeout as (f: () => void) => number)(fn);
+// No browser has setImmediate: its callers are Node-style libraries, IndexedDB (fake-indexeddb) above all, whose events
+// need the promise jobs they start to finish before its next step (checkpoint below).
+g.setImmediate = (fn: (...a: unknown[]) => void, ...args: unknown[]) => {
+  const id = nextId++; timers.set(id, {id, due: host.now(), fn, args, every: -1, immediate: true}); return id;
+};
+g.clearImmediate = g.clearTimeout;
 g.queueMicrotask ??= (fn: () => void) => { void Promise.resolve().then(fn); };
 g.requestAnimationFrame = (fn: FrameRequestCallback) => { const id = nextId++; frameCallbacks.push([id, fn]); return id; };
 g.cancelAnimationFrame = (id: number) => { frameCallbacks = frameCallbacks.filter(([i]) => i !== id); };
@@ -44,15 +49,13 @@ function report(error: unknown) {
 }
 
 const yieldJobs = () => new Promise<void>(resolve => resolve());
+/** A browser's microtask checkpoint after a task, as near as JavaScript gets: promise chains the callback started run
+ *  on (up to 32 hops) before the next timer. IndexedDB keeps a transaction open only while they do. */
+async function checkpoint() { for (let i = 0; i < 32; i++) await yieldJobs(); }
 
-/** Runs due timers (several passes, so 0 ms chains progress within one tick) and then one round
- *  of animation-frame callbacks. `budgetMs` bounds the timer passes. */
-export async function pumpFrame(budgetMs: number): Promise<void> {
-  const pollStart = wallNow();
-  pumpTiming.workerReplies = pollWorkers();
-  pumpTiming.workersMs = wallNow() - pollStart;
-  const start = host.now(), wallStart = wallNow();
-  pumpTiming.timerCalls = 0; pumpTiming.slowestMs = 0; pumpTiming.slowest = '';
+/** Runs due timers, several passes so 0 ms chains progress within one tick, for about `budgetMs`. */
+export async function runTimers(budgetMs: number): Promise<void> {
+  const start = host.now();
   for (let pass = 0; pass < 200; pass++) {
     const now = host.now();
     const due = [...timers.values()].filter(t => t.due <= now).sort((a, b) => a.due - b.due || a.id - b.id);
@@ -62,12 +65,23 @@ export async function pumpFrame(budgetMs: number): Promise<void> {
       if (t.every >= 0) t.due = now + t.every; else timers.delete(t.id);
       const t0 = wallNow();
       try { t.fn(...t.args); } catch (e) { report(e); }
+      if (t.immediate) await checkpoint();
       const took = wallNow() - t0; pumpTiming.timerCalls++;
       if (took > pumpTiming.slowestMs) { pumpTiming.slowestMs = took; pumpTiming.slowest = (t.fn as {name?: string}).name || '(anonymous)'; }
     }
     await yieldJobs();
     if (host.now() - start > budgetMs) break;
   }
+}
+
+/** Runs due timers (runTimers) and then one round of animation-frame callbacks. `budgetMs` bounds the timer passes. */
+export async function pumpFrame(budgetMs: number): Promise<void> {
+  const pollStart = wallNow();
+  pumpTiming.workerReplies = pollWorkers();
+  pumpTiming.workersMs = wallNow() - pollStart;
+  const wallStart = wallNow();
+  pumpTiming.timerCalls = 0; pumpTiming.slowestMs = 0; pumpTiming.slowest = '';
+  await runTimers(budgetMs);
   const rafStart = wallNow();
   pumpTiming.timersMs = rafStart - wallStart;
   const run = frameCallbacks; frameCallbacks = [];
@@ -79,4 +93,6 @@ export async function pumpFrame(budgetMs: number): Promise<void> {
 }
 
 export const pendingTimers = () => timers.size;
+/** A setImmediate task is waiting: IndexedDB has a step to run (a leave waits for these, leave.ts). */
+export function immediatesPending(): boolean { for (const t of timers.values()) if (t.immediate) return true; return false; }
 
