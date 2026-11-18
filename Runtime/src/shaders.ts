@@ -147,6 +147,29 @@ function prepare(material: THREE.ShaderMaterial, stage: 'vertex' | 'fragment', i
   const outs = stage === 'fragment' ? takeDeclarations(src, ['out']) : {src, decls: [] as Decl[]}; src = outs.src;
   src = src.replace(/\bvoid\s+main\s*\(\s*(void)?\s*\)/, 'void jsgb_main()');
   const defines = Object.entries(material.defines ?? {}).map(([k, val]) => `#define ${k} ${val === true ? '' : val}`);
+  // three's WebGLProgram prepends the cubeUV sampling constants (from the env target's size) to every
+  // program whose fragment pulls in <cube_uv_reflection_fragment>; a ShaderMaterial's own source never
+  // carries them, so PMREM-style helpers (three-stdlib's RoughnessMipmapper is the one PrepViz ships)
+  // fail to compile here while three compiles them in the browser. Supply three's values for its
+  // default 256px cubeUV target (generateCubeUVSize: maxMip = log2(256) - 2 = 6) when the fragment
+  // references a constant nobody defined.
+  if (stage === 'fragment') {
+    // The r/v pairs are the PMREM roughness/variance table three's cube_uv chunk carried until r151
+    // ("These defines must match with PMREMGenerator"); three-stdlib's RoughnessMipmapper still
+    // writes its variance helpers against them.
+    const cubeUvConstants: [string, string][] = [
+      ['CUBEUV_MAX_MIP', '6.0'], ['CUBEUV_TEXEL_WIDTH', String(1 / (3 * 112))], ['CUBEUV_TEXEL_HEIGHT', String(1 / 256)],
+      ['r0', '1.0'], ['v0', '0.339'], ['r1', '0.8'], ['v1', '0.276'],
+      ['r4', '0.4'], ['v4', '0.046'], ['r5', '0.305'], ['v5', '0.016'],
+    ];
+    // Only a fragment that actually pulled the chunk in (its entry points survived preprocessing)
+    // gets the constants: the one-letter names are ordinary locals in unrelated shaders.
+    if (src.includes('textureCubeUV(') || src.includes('cubeUV_minMipLevel')) {
+      for (const [name, value] of cubeUvConstants) {
+        if (new RegExp(`\\b${name}\\b`).test(src) && stageDefines[name] === undefined && !new RegExp(`^\\s*#define\\s+${name}\\b`, 'm').test(src)) defines.push(`#define ${name} ${value}`);
+      }
+    }
+  }
   const uniforms = u.decls.filter(d => !(d.name in BUILTIN_UNIFORMS) && !DERIVED.includes(d.name));
   const samplers = uniforms.filter(d => SAMPLER.test(d.type));
   const values = uniforms.filter(d => !SAMPLER.test(d.type));
