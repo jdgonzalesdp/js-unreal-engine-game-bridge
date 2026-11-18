@@ -175,13 +175,13 @@ namespace
 // Lighting tiers: the streamed quality tier (PrepViz's own low/medium/high/ultra) mapped onto Unreal
 // levers, with an fps governor that demotes the effective tier below the chosen one when the frame
 // budget slips — the Unreal mirror of the browser's adaptive governor, never a saved look change.
-//   ultra/high  Lumen preset "high" (full gathers, VSM)
-//   medium      Lumen preset "light" (half-resolution gathers and reflections, VSM)
-//   low         no Lumen; native sun/sky + captured sky light only (VSM stays: it is the cheap path)
+//   ultra/high  Lumen preset "high" (full gathers)
+//   medium      Lumen preset "light" (half-resolution gathers and reflections)
+//   low         no Lumen; native sun/sky + captured sky light only
+// Shadows are cascaded (CSM) at every tier for this game — see the re-assert in ApplyLightingTier.
 void AJsgbHost::ApplyLightingTier()
 {
 	if (LightingTierNow.IsEmpty()) { return; }
-	SetTierCVar(TEXT("r.Shadow.Virtual.Enable"), TEXT("1"));
 	const FString Mode = LightingTierNow == TEXT("ultra") || LightingTierNow == TEXT("high") ? TEXT("high")
 		: LightingTierNow == TEXT("medium") ? TEXT("light") : FString();
 	if (!Mode.IsEmpty() && bLumenAvailable)
@@ -190,6 +190,9 @@ void AJsgbHost::ApplyLightingTier()
 		if (!bLumenOn) { SetLumen(true); }
 	}
 	else if (bLumenOn) { SetLumen(false); }
+	// Cascaded shadows for this game (the host config's call): Lumen mode turns VSM on, and VSM
+	// never shadowed the floors on the interior set — re-assert CSM after any Lumen switch.
+	SetTierCVar(TEXT("r.Shadow.Virtual.Enable"), TEXT("0"));
 	if (Camera)
 	{
 		FPostProcessSettings& P = Camera->PostProcessSettings;

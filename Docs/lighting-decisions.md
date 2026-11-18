@@ -105,9 +105,13 @@ state and may differ.
 - [x] Lumen on at High/Ultra on the M2 Ultra; tiers map and demote; ≥60 fps at High, 85% scale.
   (Stage 4; measured 58–60 fps at Ultra/Lumen-high after warmup; governor needs two bad 2 s
   windows to demote and promotes back — JD's eyeball sign-off per scene still open.)
-- [x] VSM enabled; sampled VSM output matched the tuned CSM within 1/255 on the magic-hour exterior.
-  The in-harness shadow probe is implemented but currently SKIPs unless a wall and its shadow are
-  framed (JD's scene 4 set) — interior premium proof still wants that framed run + JD's eyeball.
+- [x] Shadows: **VSM rejected on live test (2026-11-17), CSM retained** — the contract's fallback.
+  VSM matched CSM within 1/255 on the exterior still, but on the interior set it never shadowed
+  the floor: same-frame A/B floor sample (62,24,7) VSM vs (20,13,1) CSM. Host config bakes CSM
+  (`r.Shadow.Virtual.Enable=0`) and the tier code re-asserts it after Lumen switches (Lumen
+  presets turn VSM on). The in-harness shadow probe exists; at the current 0.54° sun it SKIPs
+  (ground shadows run nearly parallel to the floor), and golden diffs churn while the scene is
+  being edited live — both want a settled framed run + JD's eyeball to close.
 - [x] Golden harness in one command (`Tools/lighting-golden.mjs`): status/stream, shadow probe,
   golden diff (verified mean |dL| 0.1–0.2 on re-run), perf gate (median 60 fps at Ultra).
   First golden: `Tests/golden/magic-hour-ultra.png` (uncommitted, like all of this work).
