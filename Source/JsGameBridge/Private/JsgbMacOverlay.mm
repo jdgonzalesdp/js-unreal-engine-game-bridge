@@ -65,9 +65,23 @@ namespace
 	{
 		NSView* Content = Holder.superview;
 		if (Content == nil) { return; }
-		if (!NSEqualRects(Holder.frame, Content.bounds)) { Holder.frame = Content.bounds; }
+		if (!NSEqualRects(Holder.frame, Content.bounds))
+		{
+			UE_LOG(LogJsgbMacOverlay, Display, TEXT("UI overlay: container frame was (%.0f, %.0f, %.0f x %.0f), content is (%.0f x %.0f)"),
+				Holder.frame.origin.x, Holder.frame.origin.y, Holder.frame.size.width, Holder.frame.size.height, Content.bounds.size.width, Content.bounds.size.height);
+			Holder.frame = Content.bounds;
+		}
 		WKWebView* Web = FindWebView(Holder);
-		if (Web != nil && Web != Holder && !NSEqualRects(Web.frame, Holder.bounds)) { Web.frame = Holder.bounds; }
+		if (Web != nil && Web != Holder && !NSEqualRects(Web.frame, Holder.bounds))
+		{
+			// The engine also sizes the web view itself (UpdateFrameWithViewport adds the title bar to
+			// its frame), which leaves the view taller than the page it lays out: WebKit then reads the
+			// mouse that many points lower than the layout, and menu hover lands a row low while the
+			// click (hit-tested the same way, on the row the highlight shows) still reads as right.
+			UE_LOG(LogJsgbMacOverlay, Display, TEXT("UI overlay: web view frame was (%.0f, %.0f, %.0f x %.0f), holder is (%.0f x %.0f)"),
+				Web.frame.origin.x, Web.frame.origin.y, Web.frame.size.width, Web.frame.size.height, Holder.bounds.size.width, Holder.bounds.size.height);
+			Web.frame = Holder.bounds;
+		}
 	}
 }
 
@@ -81,7 +95,10 @@ namespace
 @implementation FJsgbOverlayFrameWatch
 - (void)frameChanged:(NSNotification*)Note
 {
-	FillContent((NSView*)Note.object);
+	NSView* Object = (NSView*)Note.object;
+	// The watch sits on the container and on the web view itself: the engine sizes the web view
+	// directly too, and that change must re-pin it even when the container never moves.
+	FillContent([Object isKindOfClass:[WKWebView class]] ? Object.superview : Object);
 }
 - (void)dealloc
 {
@@ -105,6 +122,11 @@ namespace
 		if (![Holder isKindOfClass:[WKWebView class]]) { Holder.autoresizesSubviews = NO; }
 		Holder.postsFrameChangedNotifications = YES;
 		[[NSNotificationCenter defaultCenter] addObserver:Watch selector:@selector(frameChanged:) name:NSViewFrameDidChangeNotification object:Holder];
+		if (WKWebView* Web = FindWebView(Holder))
+		{
+			Web.postsFrameChangedNotifications = YES;
+			[[NSNotificationCenter defaultCenter] addObserver:Watch selector:@selector(frameChanged:) name:NSViewFrameDidChangeNotification object:Web];
+		}
 		return true;
 	}
 
@@ -204,6 +226,24 @@ namespace
 void JsgbWatchMacNativeLayers()
 {
 	MainThreadCall(^{ WatchNativeLayers(); });
+}
+
+void JsgbMacPinOverlay()
+{
+	dispatch_async(dispatch_get_main_queue(), ^
+	{
+		for (NSWindow* Window in [NSApp windows])
+		{
+			NSView* Content = Window.contentView;
+			if (Content == nil) { continue; }
+			for (NSView* Child in Content.subviews)
+			{
+				if (!HoldsWebView(Child)) { continue; }
+				WatchContainer(Child);
+				FillContent(Child);
+			}
+		}
+	});
 }
 
 void JsgbMakeMacWebViewsTransparent()

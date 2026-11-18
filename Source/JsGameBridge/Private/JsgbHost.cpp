@@ -2074,6 +2074,12 @@ void AJsgbHost::Tick(float DeltaSeconds)
 	UpdateViewBars();
 	UpdateNativeSky();
 	UpdateLightingTier(DeltaSeconds);
+#if PLATFORM_MAC
+	if (UIPort) { JsgbMacHoldCursor(UIPort->PageCursor); }
+	// The engine re-sizes the overlay web view with the title bar added whenever Slate lays out;
+	// re-pin it twice a second so the mouse and the layout agree (JsgbMacOverlay.h).
+	if ((Frame & 31) == 0) { JsgbMacPinOverlay(); }
+#endif
 
 	if (ReadyFrame < 0 && Bridge->bReady) { ReadyFrame = Frame; ReadySeconds = GameSeconds(); CaptureStart = ReadySeconds; Bridge->Log(TEXT("log"), FString::Printf(TEXT("game ready at host frame %lld"), Frame)); }
 	RunScript();

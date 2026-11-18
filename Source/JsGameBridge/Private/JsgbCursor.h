@@ -29,4 +29,8 @@ void JsgbRequeryCursor();
 /** The cursor the Mac shows now, which WebKit set from the page's CSS; null before any. Slate is handed it, so WebKit is
  *  the one writer (JsgbCursorMac.mm). With -JsgbLogCursor each change is logged with the page's reported cursor. */
 void* JsgbMacShownCursor(TOptional<EMouseCursor::Type> PageCursor);
+/** Per-frame hold (game thread): while the page wants its image cursor, put the held copy back whenever
+ *  WebKit has reset it to the arrow for a DOM patch. Slate only re-asks on mouse move, so without this
+ *  the Direct Select arrow flickers against the plain arrow whenever the mirrored page changes. */
+void JsgbMacHoldCursor(TOptional<EMouseCursor::Type> PageCursor);
 #endif

@@ -91,4 +91,10 @@ void* JsgbMacShownCursor(TOptional<EMouseCursor::Type> PageCursor)
 	if (Answer && Shown != Answer) { [Answer set]; }
 	return (void*)Answer;
 }
+
+void JsgbMacHoldCursor(TOptional<EMouseCursor::Type> PageCursor)
+{
+	if (!PageCursor.IsSet() || *PageCursor != EMouseCursor::Custom || !HeldCopy) { return; }
+	if ([NSCursor currentCursor] != HeldCopy) { [HeldCopy set]; }
+}
 #endif
