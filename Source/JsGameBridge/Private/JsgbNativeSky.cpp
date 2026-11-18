@@ -193,6 +193,11 @@ void AJsgbHost::ApplyLightingTier()
 	// Cascaded shadows for this game (the host config's call): Lumen mode turns VSM on, and VSM
 	// never shadowed the floors on the interior set — re-assert CSM after any Lumen switch.
 	SetTierCVar(TEXT("r.Shadow.Virtual.Enable"), TEXT("0"));
+	// Shadow maps exist at EVERY tier (they are the product): a saved sg.ShadowQuality=0 from
+	// handheld-preset runs persisted in the user settings and silently disabled every shadow
+	// map in desktop runs — casters, lights and cascades all correct, nothing drawn. Low keeps
+	// small maps; it never turns shadows off.
+	SetTierCVar(TEXT("sg.ShadowQuality"), LightingTierNow == TEXT("low") ? TEXT("1") : LightingTierNow == TEXT("medium") ? TEXT("2") : TEXT("3"));
 	if (Camera)
 	{
 		FPostProcessSettings& P = Camera->PostProcessSettings;
