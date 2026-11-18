@@ -1634,6 +1634,10 @@ void UJsgbSceneMirror::ApplyFrame(const float* D, int32 Count, const float* Inst
 		if ((DebugHiddenKinds & (1 << Ent.Kind)) || (Ent.Id >= DebugHiddenIds.X && Ent.Id <= DebugHiddenIds.Y)) { if (C->IsVisible()) { C->SetVisibility(false); } Ent.Seen = Stamp; return; }
 		const bool bShadow = (Flags & 1) != 0;
 		if (C->CastShadow != bShadow) { C->SetCastShadow(bShadow); }
+		// three.js casts with the material's opposite faces (shadowSide), so thin single-sided
+		// planes (flags, cards) shade from either sun direction. Unreal's depth pass culls by
+		// material sidedness and drops those casters entirely without this flag.
+		if (C->bCastShadowAsTwoSided != bShadow) { C->bCastShadowAsTwoSided = bShadow; }
 		// Surfaces three.js draws without fog mark themselves in the custom stencil for the scene post.
 		const FJsgbMaterial* First = Ent.Materials.Num() ? Materials.Find(Ent.Materials[0]) : nullptr;
 		// Native sky: the game's sky dome (drawn first, without depth) gives way to SkyAtmosphere.
